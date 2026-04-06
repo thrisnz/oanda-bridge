@@ -18,17 +18,24 @@ def get_position(instrument):
     )
 
     data = r.json()
+    print("RAW POSITIONS:", data)
 
     for pos in data.get("positions", []):
+        print("CHECKING:", pos["instrument"])
         if pos["instrument"] == instrument:
             long_units = float(pos["long"]["units"])
             short_units = float(pos["short"]["units"])
-            return long_units - short_units
+            current = long_units - short_units
+            print("MATCHED POSITION:", current)
+            return current
 
+    print("NO MATCH → POSITION = 0")
     return 0.0
 
 
 def send_order(units, instrument):
+    print("SENDING ORDER:", units, instrument)
+
     r = requests.post(
         f"{BASE_URL}/accounts/{ACCOUNT}/orders",
         headers={
@@ -50,9 +57,9 @@ def send_order(units, instrument):
 
 @app.route("/", methods=["POST"])
 def webhook():
-    # force JSON parse (TradingView quirk)
     data = request.get_json(force=True)
 
+    print("\n====== NEW REQUEST ======")
     print("INCOMING:", data)
 
     if not data:
@@ -62,32 +69,38 @@ def webhook():
         print("AUTH FAILED")
         return "unauthorized", 403
 
-    action = data["action"].lower()
+    action = str(data["action"]).lower().strip()
     size = float(data["size"])
     instrument = data["ticker"]
 
-    # 🔥 WHAT DO WE HAVE
-    current_position = get_position(instrument)
+    print("ACTION:", action)
+    print("SIZE:", size)
+    print("INSTRUMENT:", instrument)
 
-    # 🔥 WHAT DO WE WANT
+    # 🔥 STEP 1 — WHAT DO WE HAVE
+    current = get_position(instrument)
+
+    # 🔥 STEP 2 — WHAT DO WE WANT (NO AMBIGUITY)
     if action == "buy":
-        desired_position = size
+        target = abs(size)       # always long
     elif action == "sell":
-        desired_position = -size
+        target = -abs(size)      # always short
     else:
-        print("INVALID ACTION:", action)
+        print("INVALID ACTION")
         return "error", 400
 
-    # 🔥 WHAT DO WE NEED TO SEND
-    units_to_send = desired_position - current_position
+    # 🔥 STEP 3 — WHAT DO WE SEND
+    units = target - current
 
-    print("HAVE:", current_position)
-    print("WANT:", desired_position)
-    print("SEND:", units_to_send)
+    print("CURRENT:", current)
+    print("TARGET:", target)
+    print("UNITS TO SEND:", units)
 
-    # send only if needed
-    if abs(units_to_send) > 0:
-        send_order(int(units_to_send), instrument)
+    # 🔥 STEP 4 — EXECUTE
+    if abs(units) > 0:
+        send_order(int(units), instrument)
+    else:
+        print("NO TRADE NEEDED")
 
     return "ok"
 
