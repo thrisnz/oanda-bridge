@@ -1,3 +1,5 @@
+print("VERSION 2 LIVE")
+
 from flask import Flask, request
 import requests
 import os
