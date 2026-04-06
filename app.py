@@ -22,8 +22,8 @@ def get_position(instrument):
 
     for pos in data.get("positions", []):
         if pos["instrument"] == instrument:
-            long_units = float(pos["long"]["units"])   # ✅ FIXED
-            short_units = float(pos["short"]["units"]) # ✅ FIXED
+            long_units = float(pos["long"]["units"])
+            short_units = float(pos["short"]["units"])
             return long_units - short_units
 
     return 0.0
@@ -51,9 +51,14 @@ def send_order(units, instrument):
 
 @app.route("/", methods=["POST"])
 def webhook():
-    data = request.json
+    # 🔥 FORCE JSON PARSE (this was your missing piece)
+    data = request.get_json(force=True)
 
     print("INCOMING:", data)
+
+    if not data:
+        print("NO DATA RECEIVED")
+        return "bad request", 400
 
     # auth check
     if data.get("key") != SECRET:
@@ -61,19 +66,19 @@ def webhook():
         return "unauthorized", 403
 
     action = data["action"]
-    size = float(data["size"])   # allow flexibility
+    size = float(data["size"])
     instrument = data["ticker"]
 
     current = get_position(instrument)
     print("CURRENT POSITION:", current)
 
-    # 🎯 TARGET POSITION LOGIC (clean + universal)
+    # 🎯 target position logic (handles reverse automatically)
     target = size if action == "buy" else -size
     delta = target - current
 
     print("TARGET:", target, "DELTA:", delta)
 
-    # avoid sending zero orders
+    # send only if needed
     if abs(delta) > 0:
         send_order(int(delta), instrument)
 
