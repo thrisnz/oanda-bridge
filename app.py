@@ -6,7 +6,7 @@ app = Flask(__name__)
 
 ACCOUNT = os.environ.get("ACCOUNT")
 API_KEY = os.environ.get("API_KEY")
-SECRET = os.environ.get("SECRET")  # ✅ single source of truth
+SECRET = os.environ.get("SECRET")
 
 # LIVE OANDA endpoint
 BASE_URL = "https://api-fxtrade.oanda.com/v3"
@@ -22,11 +22,11 @@ def get_position(instrument):
 
     for pos in data.get("positions", []):
         if pos["instrument"] == instrument:
-            long_units = int(pos["long"]["units"])
-            short_units = int(pos["short"]["units"])
+            long_units = float(pos["long"]["units"])   # ✅ FIXED
+            short_units = float(pos["short"]["units"]) # ✅ FIXED
             return long_units - short_units
 
-    return 0
+    return 0.0
 
 
 def send_order(units, instrument):
@@ -46,7 +46,6 @@ def send_order(units, instrument):
         }
     )
 
-    # ✅ log response (CRITICAL for debugging)
     print("OANDA RESPONSE:", r.status_code, r.text)
 
 
@@ -54,28 +53,29 @@ def send_order(units, instrument):
 def webhook():
     data = request.json
 
-    print("INCOMING:", data)  # ✅ log incoming request
+    print("INCOMING:", data)
 
-    # ✅ auth check using env variable
+    # auth check
     if data.get("key") != SECRET:
         print("AUTH FAILED:", data.get("key"), "vs", SECRET)
         return "unauthorized", 403
 
     action = data["action"]
-    size = int(data["size"])
+    size = float(data["size"])   # allow flexibility
     instrument = data["ticker"]
 
     current = get_position(instrument)
+    print("CURRENT POSITION:", current)
 
-    if action == "buy":
-        if current < 0:
-            send_order(abs(current), instrument)
-        send_order(size, instrument)
+    # 🎯 TARGET POSITION LOGIC (clean + universal)
+    target = size if action == "buy" else -size
+    delta = target - current
 
-    elif action == "sell":
-        if current > 0:
-            send_order(-abs(current), instrument)
-        send_order(-size, instrument)
+    print("TARGET:", target, "DELTA:", delta)
+
+    # avoid sending zero orders
+    if abs(delta) > 0:
+        send_order(int(delta), instrument)
 
     return "ok"
 
