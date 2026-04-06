@@ -6,8 +6,9 @@ app = Flask(__name__)
 
 ACCOUNT = os.environ.get("ACCOUNT")
 API_KEY = os.environ.get("API_KEY")
+SECRET = os.environ.get("SECRET")  # ✅ single source of truth
 
-# LIVE OANDA endpoint (not practice)
+# LIVE OANDA endpoint
 BASE_URL = "https://api-fxtrade.oanda.com/v3"
 
 
@@ -29,7 +30,7 @@ def get_position(instrument):
 
 
 def send_order(units, instrument):
-    requests.post(
+    r = requests.post(
         f"{BASE_URL}/accounts/{ACCOUNT}/orders",
         headers={
             "Authorization": f"Bearer {API_KEY}",
@@ -45,30 +46,36 @@ def send_order(units, instrument):
         }
     )
 
+    # ✅ log response (CRITICAL for debugging)
+    print("OANDA RESPONSE:", r.status_code, r.text)
+
 
 @app.route("/", methods=["POST"])
 def webhook():
     data = request.json
 
-    # simple auth
-    if data.get("key") != "g7Kp!92xLq":
+    print("INCOMING:", data)  # ✅ log incoming request
+
+    # ✅ auth check using env variable
+    if data.get("key") != SECRET:
+        print("AUTH FAILED:", data.get("key"), "vs", SECRET)
         return "unauthorized", 403
 
     action = data["action"]
     size = int(data["size"])
-    instrument = data["ticker"]  # pure pass-through
+    instrument = data["ticker"]
 
     current = get_position(instrument)
 
     if action == "buy":
         if current < 0:
-            send_order(abs(current), instrument)  # close short
-        send_order(size, instrument)  # open long
+            send_order(abs(current), instrument)
+        send_order(size, instrument)
 
     elif action == "sell":
         if current > 0:
-            send_order(-abs(current), instrument)  # close long
-        send_order(-size, instrument)  # open short
+            send_order(-abs(current), instrument)
+        send_order(-size, instrument)
 
     return "ok"
 
