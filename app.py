@@ -8,7 +8,6 @@ ACCOUNT = os.environ.get("ACCOUNT")
 API_KEY = os.environ.get("API_KEY")
 SECRET = os.environ.get("SECRET")
 
-# LIVE OANDA endpoint
 BASE_URL = "https://api-fxtrade.oanda.com/v3"
 
 
@@ -51,36 +50,44 @@ def send_order(units, instrument):
 
 @app.route("/", methods=["POST"])
 def webhook():
-    # 🔥 FORCE JSON PARSE (this was your missing piece)
+    # force JSON parse (TradingView quirk)
     data = request.get_json(force=True)
 
     print("INCOMING:", data)
 
     if not data:
-        print("NO DATA RECEIVED")
         return "bad request", 400
 
-    # auth check
     if data.get("key") != SECRET:
-        print("AUTH FAILED:", data.get("key"), "vs", SECRET)
+        print("AUTH FAILED")
         return "unauthorized", 403
 
-    action = data["action"]
+    action = data["action"].lower()
     size = float(data["size"])
     instrument = data["ticker"]
 
-    current = get_position(instrument)
-    print("CURRENT POSITION:", current)
+    # 🔥 WHAT DO WE HAVE
+    current_position = get_position(instrument)
 
-    # 🎯 target position logic (handles reverse automatically)
-    target = size if action == "buy" else -size
-    delta = target - current
+    # 🔥 WHAT DO WE WANT
+    if action == "buy":
+        desired_position = size
+    elif action == "sell":
+        desired_position = -size
+    else:
+        print("INVALID ACTION:", action)
+        return "error", 400
 
-    print("TARGET:", target, "DELTA:", delta)
+    # 🔥 WHAT DO WE NEED TO SEND
+    units_to_send = desired_position - current_position
+
+    print("HAVE:", current_position)
+    print("WANT:", desired_position)
+    print("SEND:", units_to_send)
 
     # send only if needed
-    if abs(delta) > 0:
-        send_order(int(delta), instrument)
+    if abs(units_to_send) > 0:
+        send_order(int(units_to_send), instrument)
 
     return "ok"
 
