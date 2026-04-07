@@ -177,6 +177,20 @@ def webhook():
 
     return "ok"
 
+# =========================
+# 📊 ANALYZER
+# =========================
+@app.route("/analyze", methods=["GET"])
+def run_analysis():
+    import subprocess
+
+    result = subprocess.run(
+        ["python", "analyzer.py"],
+        capture_output=True,
+        text=True
+    )
+
+    return f"<pre>{result.stdout}</pre>"
 
 # =========================
 # ▶ RUN
