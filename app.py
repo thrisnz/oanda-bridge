@@ -44,7 +44,6 @@ def get_position(instrument):
             if pos["instrument"] == instrument:
                 long_units = float(pos["long"]["units"])
                 short_units = float(pos["short"]["units"])
-
                 return long_units + short_units
 
     except Exception as e:
@@ -54,70 +53,77 @@ def get_position(instrument):
 
 
 # =========================
-# 💰 GET PRICE
-# =========================
-def get_price(instrument):
-    try:
-        r = requests.get(
-            f"{BASE_URL}/accounts/{ACCOUNT}/pricing",
-            headers={"Authorization": f"Bearer {API_KEY}"},
-            params={"instruments": instrument},
-            timeout=5
-        )
-
-        data = r.json()
-        price = float(data["prices"][0]["bids"][0]["price"])
-        return price
-
-    except Exception as e:
-        print("PRICE ERROR:", e, flush=True)
-        return None
-
-
-# =========================
-# 🚀 SEND ORDER (WITH SL)
+# 🚀 SEND ORDER (FIXED SL)
 # =========================
 def send_order(units, instrument, sl_distance=None):
     print("SENDING:", units, instrument, flush=True)
 
-    order = {
-        "instrument": instrument,
-        "units": str(int(units)),
-        "type": "MARKET",
-        "positionFill": "DEFAULT"
-    }
-
-    # 🔥 OPTIONAL SL
-    if sl_distance is not None:
-        price = get_price(instrument)
-
-        if price is not None:
-            if units > 0:
-                sl_price = price - sl_distance
-            else:
-                sl_price = price + sl_distance
-
-            order["stopLossOnFill"] = {
-                "price": str(round(sl_price, 3))
-            }
-
-            print("SL DIST:", sl_distance, flush=True)
-            print("SL PRICE:", sl_price, flush=True)
-        else:
-            print("SKIP SL (no price)", flush=True)
-
     try:
+        # 1️⃣ PLACE ORDER
         r = requests.post(
             f"{BASE_URL}/accounts/{ACCOUNT}/orders",
             headers={
                 "Authorization": f"Bearer {API_KEY}",
                 "Content-Type": "application/json"
             },
-            json={"order": order},
+            json={
+                "order": {
+                    "instrument": instrument,
+                    "units": str(int(units)),
+                    "type": "MARKET",
+                    "positionFill": "DEFAULT"
+                }
+            },
             timeout=5
         )
 
         print("OANDA:", r.status_code, r.text, flush=True)
+
+        if r.status_code != 201:
+            return
+
+        data = r.json()
+
+        # 2️⃣ GET FILL PRICE
+        fill = data.get("orderFillTransaction", {})
+        fill_price = float(fill["price"])
+
+        print("FILL PRICE:", fill_price, flush=True)
+
+        # 🚫 NO SL → DONE
+        if sl_distance is None:
+            return
+
+        # 3️⃣ CALCULATE SL FROM FILL
+        if units > 0:
+            sl_price = fill_price - sl_distance
+        else:
+            sl_price = fill_price + sl_distance
+
+        sl_price = round(sl_price, 3)
+
+        print("SL DIST:", sl_distance, flush=True)
+        print("SL PRICE:", sl_price, flush=True)
+
+        # 4️⃣ GET TRADE ID
+        trade_id = fill["tradeOpened"]["tradeID"]
+
+        # 5️⃣ ATTACH SL
+        r2 = requests.put(
+            f"{BASE_URL}/accounts/{ACCOUNT}/trades/{trade_id}/orders",
+            headers={
+                "Authorization": f"Bearer {API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "stopLoss": {
+                    "price": str(sl_price)
+                }
+            },
+            timeout=5
+        )
+
+        print("SL ATTACH:", r2.status_code, r2.text, flush=True)
 
     except Exception as e:
         print("ORDER ERROR:", e, flush=True)
