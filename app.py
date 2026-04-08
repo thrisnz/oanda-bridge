@@ -36,7 +36,7 @@ def get_position(inst):
     return 0.0
 
 
-def send_order(units, inst, sl=None):
+def send_order(units, inst, sl=None, tp=None):
     print("SENDING:", units, inst, flush=True)
 
     try:
@@ -67,13 +67,17 @@ def send_order(units, inst, sl=None):
 
         payload = {}
 
-        # SL in price distance
+        # stop loss (price distance)
         if sl is not None:
             sl_price = price - sl if units > 0 else price + sl
-            sl_price = round(sl_price, 3)
+            payload["stopLoss"] = {"price": str(round(sl_price, 3))}
+            print("SL:", sl, "→", sl_price, flush=True)
 
-            payload["stopLoss"] = {"price": str(sl_price)}
-            print("SL DIST:", sl, "SL PRICE:", sl_price, flush=True)
+        # take profit (price distance)
+        if tp is not None:
+            tp_price = price + tp if units > 0 else price - tp
+            payload["takeProfit"] = {"price": str(round(tp_price, 3))}
+            print("TP:", tp, "→", tp_price, flush=True)
 
         if payload:
             r2 = requests.put(
@@ -104,6 +108,7 @@ def webhook():
     inst = data["ticker"].upper()
 
     sl = parse_float(data.get("sl"))
+    tp = parse_float(data.get("tp"))
 
     cur = get_position(inst)
 
@@ -118,7 +123,7 @@ def webhook():
     print("CURRENT:", cur, "TARGET:", tgt, "DELTA:", units, flush=True)
 
     if int(units) != 0:
-        send_order(units, inst, sl)
+        send_order(units, inst, sl, tp)
     else:
         print("NO TRADE", flush=True)
 
