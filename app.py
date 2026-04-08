@@ -9,7 +9,6 @@ SECRET = os.environ.get("SECRET")
 BASE_URL = "https://api-fxtrade.oanda.com/v3"
 
 
-# parse optional numeric fields
 def parse_float(v):
     try:
         return None if v in ("", None) else float(v)
@@ -17,15 +16,6 @@ def parse_float(v):
         return None
 
 
-# pip size per instrument
-def pip_size(inst):
-    if inst.endswith("JPY"): return 0.01
-    if inst.startswith("XAU"): return 0.1
-    if inst.startswith("WTICO"): return 0.01
-    return 0.0001
-
-
-# get current net position
 def get_position(inst):
     try:
         r = requests.get(
@@ -46,16 +36,24 @@ def get_position(inst):
     return 0.0
 
 
-# place market order, then attach SL/TP (in pips if provided)
-def send_order(units, inst, sl_pips=None, tp_pips=None):
+def send_order(units, inst, sl=None):
     print("SENDING:", units, inst, flush=True)
 
     try:
-        # place order
         r = requests.post(
             f"{BASE_URL}/accounts/{ACCOUNT}/orders",
-            headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
-            json={"order": {"instrument": inst, "units": str(int(units)), "type": "MARKET", "positionFill": "DEFAULT"}},
+            headers={
+                "Authorization": f"Bearer {API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "order": {
+                    "instrument": inst,
+                    "units": str(int(units)),
+                    "type": "MARKET",
+                    "positionFill": "DEFAULT"
+                }
+            },
             timeout=5
         )
 
@@ -67,28 +65,23 @@ def send_order(units, inst, sl_pips=None, tp_pips=None):
         price = float(fill["price"])
         trade_id = fill["tradeOpened"]["tradeID"]
 
-        ps = pip_size(inst)
         payload = {}
 
-        # stop loss
-        if sl_pips is not None:
-            d = sl_pips * ps
-            sl = price - d if units > 0 else price + d
-            payload["stopLoss"] = {"price": str(round(sl, 5))}
-            print("SL:", sl_pips, payload["stopLoss"]["price"], flush=True)
+        # SL in price distance
+        if sl is not None:
+            sl_price = price - sl if units > 0 else price + sl
+            sl_price = round(sl_price, 3)
 
-        # take profit
-        if tp_pips is not None:
-            d = tp_pips * ps
-            tp = price + d if units > 0 else price - d
-            payload["takeProfit"] = {"price": str(round(tp, 5))}
-            print("TP:", tp_pips, payload["takeProfit"]["price"], flush=True)
+            payload["stopLoss"] = {"price": str(sl_price)}
+            print("SL DIST:", sl, "SL PRICE:", sl_price, flush=True)
 
-        # attach SL/TP if present
         if payload:
             r2 = requests.put(
                 f"{BASE_URL}/accounts/{ACCOUNT}/trades/{trade_id}/orders",
-                headers={"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"},
+                headers={
+                    "Authorization": f"Bearer {API_KEY}",
+                    "Content-Type": "application/json"
+                },
                 json=payload,
                 timeout=5
             )
@@ -98,7 +91,6 @@ def send_order(units, inst, sl_pips=None, tp_pips=None):
         print("ORDER ERROR:", e, flush=True)
 
 
-# webhook entry
 @app.route("/", methods=["POST"])
 def webhook():
     data = request.get_json(force=True)
@@ -111,8 +103,7 @@ def webhook():
     size = float(data["size"])
     inst = data["ticker"].upper()
 
-    sl_pips = parse_float(data.get("sl"))
-    tp_pips = parse_float(data.get("tp"))
+    sl = parse_float(data.get("sl"))
 
     cur = get_position(inst)
 
@@ -127,14 +118,13 @@ def webhook():
     print("CURRENT:", cur, "TARGET:", tgt, "DELTA:", units, flush=True)
 
     if int(units) != 0:
-        send_order(units, inst, sl_pips, tp_pips)
+        send_order(units, inst, sl)
     else:
         print("NO TRADE", flush=True)
 
     return "ok"
 
 
-# run analyzer manually
 @app.route("/analyze", methods=["GET"])
 def analyze():
     import subprocess
