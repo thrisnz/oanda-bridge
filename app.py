@@ -1,5 +1,5 @@
 from flask import Flask, request
-import requests, os, time
+import requests, os
 
 app = Flask(__name__)
 
@@ -8,11 +8,18 @@ API_KEY = os.environ.get("API_KEY")
 SECRET = os.environ.get("SECRET")
 BASE_URL = "https://api-fxtrade.oanda.com/v3"
 
-ADD_THRESHOLD = 0.05   # 5% DD trigger
+ADD_THRESHOLD = 0.05
 MIN_UNITS = 1
 
 
 # ---------- HELPERS ----------
+
+def headers():
+    return {
+        "Authorization": f"Bearer {API_KEY}",
+        "Content-Type": "application/json"
+    }
+
 
 def parse_float(v):
     try:
@@ -25,7 +32,7 @@ def get_position(inst):
     try:
         r = requests.get(
             f"{BASE_URL}/accounts/{ACCOUNT}/openPositions",
-            headers={"Authorization": f"Bearer {API_KEY}"},
+            headers=headers(),
             timeout=5
         )
 
@@ -35,7 +42,9 @@ def get_position(inst):
 
         for p in r.json().get("positions", []):
             if p["instrument"] == inst:
-                return float(p["long"]["units"]) + float(p["short"]["units"])
+                long_units = float(p["long"]["units"])
+                short_units = float(p["short"]["units"])
+                return long_units + short_units
 
     except Exception as e:
         print("POSITION EXCEPTION:", e, flush=True)
@@ -47,7 +56,7 @@ def get_instrument_dd(inst):
     try:
         r = requests.get(
             f"{BASE_URL}/accounts/{ACCOUNT}/openTrades",
-            headers={"Authorization": f"Bearer {API_KEY}"},
+            headers=headers(),
             timeout=5
         )
 
@@ -55,8 +64,7 @@ def get_instrument_dd(inst):
             print("DD ERROR:", r.text, flush=True)
             return 0, 0
 
-        trades = r.json().get("trades", [])
-        trades = [t for t in trades if t["instrument"] == inst]
+        trades = [t for t in r.json().get("trades", []) if t["instrument"] == inst]
 
         if not trades:
             return 0, 0
@@ -78,45 +86,21 @@ def get_instrument_dd(inst):
         return 0, 0
 
 
-def close_all_positions(inst):
-    print("CLOSING ALL:", inst, flush=True)
+# ---------- ORDER ----------
 
-    try:
-        r = requests.put(
-            f"{BASE_URL}/accounts/{ACCOUNT}/positions/{inst}/close",
-            headers={
-                "Authorization": f"Bearer {API_KEY}",
-                "Content-Type": "application/json"
-            },
-            json={
-                "longUnits": "ALL",
-                "shortUnits": "ALL"
-            },
-            timeout=5
-        )
-
-        print("CLOSE:", r.status_code, r.text, flush=True)
-
-    except Exception as e:
-        print("CLOSE ERROR:", e, flush=True)
-
-
-def send_order(units, inst, sl=None, tp=None):
-    print("SENDING:", units, inst, flush=True)
+def send_delta_order(delta, inst, sl=None, tp=None):
+    print("SENDING DELTA:", delta, inst, flush=True)
 
     try:
         r = requests.post(
             f"{BASE_URL}/accounts/{ACCOUNT}/orders",
-            headers={
-                "Authorization": f"Bearer {API_KEY}",
-                "Content-Type": "application/json"
-            },
+            headers=headers(),
             json={
                 "order": {
                     "instrument": inst,
-                    "units": str(int(units)),
+                    "units": str(int(delta)),
                     "type": "MARKET",
-                    "positionFill": "OPEN_ONLY"
+                    "positionFill": "DEFAULT"
                 }
             },
             timeout=5
@@ -127,31 +111,40 @@ def send_order(units, inst, sl=None, tp=None):
         if r.status_code != 201:
             return
 
-        fill = r.json().get("orderFillTransaction", {})
-        price = float(fill["price"])
-        trade_id = fill["tradeOpened"]["tradeID"]
+        data = r.json()
+
+        fill = data.get("orderFillTransaction")
+        if not fill:
+            print("NO FILL (likely rejected or canceled)", flush=True)
+            return
+
+        price = float(fill.get("price", 0))
+        trade_opened = fill.get("tradeOpened")
+
+        if not trade_opened:
+            print("NO TRADE OPENED (pure close or net reduce)", flush=True)
+            return
+
+        trade_id = trade_opened["tradeID"]
 
         payload = {}
 
         # SL
         if sl is not None:
-            sl_price = price - sl if units > 0 else price + sl
+            sl_price = price - sl if delta > 0 else price + sl
             payload["stopLoss"] = {"price": str(round(sl_price, 3))}
             print("SL:", sl_price, flush=True)
 
         # TP
         if tp is not None:
-            tp_price = price + tp if units > 0 else price - tp
+            tp_price = price + tp if delta > 0 else price - tp
             payload["takeProfit"] = {"price": str(round(tp_price, 3))}
             print("TP:", tp_price, flush=True)
 
         if payload:
             r2 = requests.put(
                 f"{BASE_URL}/accounts/{ACCOUNT}/trades/{trade_id}/orders",
-                headers={
-                    "Authorization": f"Bearer {API_KEY}",
-                    "Content-Type": "application/json"
-                },
+                headers=headers(),
                 json=payload,
                 timeout=5
             )
@@ -181,56 +174,39 @@ def webhook():
 
     cur = get_position(inst)
 
-    # 🔥 FLIP LOGIC
-    if (action == "buy" and cur < 0) or (action == "sell" and cur > 0):
-        print("FLIP DETECTED", flush=True)
+    # 🎯 TARGET POSITION
+    target = size if action == "buy" else -size
 
-        close_all_positions(inst)
-        time.sleep(0.3)
+    # 🎯 DELTA (THIS FIXES EVERYTHING)
+    delta = target - cur
 
-        units = abs(size) if action == "buy" else -abs(size)
+    print("CURRENT:", cur, "TARGET:", target, "DELTA:", delta, flush=True)
 
-        if abs(units) >= MIN_UNITS:
-            send_order(units, inst, sl, tp)
+    if abs(delta) < MIN_UNITS:
+        print("NO CHANGE NEEDED", flush=True)
+        return "skip"
 
-        return "flip"
-
-    # 🔥 DD STACKING LOGIC
+    # 🔥 DD CONTROL
     unrealized, dd = get_instrument_dd(inst)
 
     allow_add = False
 
-    if unrealized == 0:
+    if cur == 0:
         allow_add = True
     elif unrealized < 0 and dd >= ADD_THRESHOLD:
         allow_add = True
+    elif (action == "buy" and cur < 0) or (action == "sell" and cur > 0):
+        # always allow flip
+        allow_add = True
 
-    print("ALLOW ADD:", allow_add, flush=True)
+    print("ALLOW:", allow_add, flush=True)
 
     if not allow_add:
         return "skip"
 
-    # 🔥 EXECUTE NEW TRADE
-    if action == "buy":
-        units = abs(size)
-    elif action == "sell":
-        units = -abs(size)
-    else:
-        return "bad action", 400
-
-    if abs(units) >= MIN_UNITS:
-        send_order(units, inst, sl, tp)
+    send_delta_order(delta, inst, sl, tp)
 
     return "ok"
-
-
-# ---------- ANALYZE ----------
-
-@app.route("/analyze", methods=["GET"])
-def analyze():
-    import subprocess
-    r = subprocess.run(["python", "analyzer.py"], capture_output=True, text=True)
-    return f"<pre>{r.stdout}</pre>"
 
 
 # ---------- RUN ----------
