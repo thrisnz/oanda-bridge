@@ -1,5 +1,5 @@
 from flask import Flask, request
-import requests, os
+import requests, os, time
 
 app = Flask(__name__)
 
@@ -77,7 +77,7 @@ def get_instrument_dd(inst):
 
         dd = abs(unrealized) / margin
 
-        print("DD:", dd, "PL:", unrealized, flush=True)
+        print(f"PL={unrealized} MARGIN={margin} DD={dd:.4f}", flush=True)
 
         return unrealized, dd
 
@@ -86,10 +86,27 @@ def get_instrument_dd(inst):
         return 0, 0
 
 
+def close_all(inst):
+    print("CLOSING ALL:", inst, flush=True)
+
+    try:
+        r = requests.put(
+            f"{BASE_URL}/accounts/{ACCOUNT}/positions/{inst}/close",
+            headers=headers(),
+            json={"longUnits": "ALL", "shortUnits": "ALL"},
+            timeout=5
+        )
+
+        print("CLOSE:", r.status_code, r.text, flush=True)
+
+    except Exception as e:
+        print("CLOSE ERROR:", e, flush=True)
+
+
 # ---------- ORDER ----------
 
-def send_delta_order(delta, inst, sl=None, tp=None):
-    print("SENDING DELTA:", delta, inst, flush=True)
+def send_order(units, inst, sl=None, tp=None):
+    print("SENDING:", units, inst, flush=True)
 
     try:
         r = requests.post(
@@ -98,9 +115,9 @@ def send_delta_order(delta, inst, sl=None, tp=None):
             json={
                 "order": {
                     "instrument": inst,
-                    "units": str(int(delta)),
+                    "units": str(int(units)),
                     "type": "MARKET",
-                    "positionFill": "DEFAULT"
+                    "positionFill": "OPEN_ONLY"
                 }
             },
             timeout=5
@@ -111,18 +128,12 @@ def send_delta_order(delta, inst, sl=None, tp=None):
         if r.status_code != 201:
             return
 
-        data = r.json()
-
-        fill = data.get("orderFillTransaction")
-        if not fill:
-            print("NO FILL (likely rejected or canceled)", flush=True)
-            return
-
+        fill = r.json().get("orderFillTransaction", {})
         price = float(fill.get("price", 0))
         trade_opened = fill.get("tradeOpened")
 
         if not trade_opened:
-            print("NO TRADE OPENED (pure close or net reduce)", flush=True)
+            print("NO TRADE OPENED", flush=True)
             return
 
         trade_id = trade_opened["tradeID"]
@@ -131,85 +142,10 @@ def send_delta_order(delta, inst, sl=None, tp=None):
 
         # SL
         if sl is not None:
-            sl_price = price - sl if delta > 0 else price + sl
+            sl_price = price - sl if units > 0 else price + sl
             payload["stopLoss"] = {"price": str(round(sl_price, 3))}
-            print("SL:", sl_price, flush=True)
 
         # TP
         if tp is not None:
-            tp_price = price + tp if delta > 0 else price - tp
-            payload["takeProfit"] = {"price": str(round(tp_price, 3))}
-            print("TP:", tp_price, flush=True)
-
-        if payload:
-            r2 = requests.put(
-                f"{BASE_URL}/accounts/{ACCOUNT}/trades/{trade_id}/orders",
-                headers=headers(),
-                json=payload,
-                timeout=5
-            )
-
-            print("ATTACH:", r2.status_code, r2.text, flush=True)
-
-    except Exception as e:
-        print("ORDER ERROR:", e, flush=True)
-
-
-# ---------- WEBHOOK ----------
-
-@app.route("/", methods=["POST"])
-def webhook():
-    data = request.get_json(force=True)
-    print("\n=== NEW SIGNAL ===", data, flush=True)
-
-    if data.get("key") != SECRET:
-        return "unauthorized", 403
-
-    action = data["action"].lower()
-    size = float(data["size"])
-    inst = data["ticker"].upper()
-
-    sl = parse_float(data.get("sl"))
-    tp = parse_float(data.get("tp"))
-
-    cur = get_position(inst)
-
-    # 🎯 TARGET POSITION
-    target = size if action == "buy" else -size
-
-    # 🎯 DELTA (THIS FIXES EVERYTHING)
-    delta = target - cur
-
-    print("CURRENT:", cur, "TARGET:", target, "DELTA:", delta, flush=True)
-
-    if abs(delta) < MIN_UNITS:
-        print("NO CHANGE NEEDED", flush=True)
-        return "skip"
-
-    # 🔥 DD CONTROL
-    unrealized, dd = get_instrument_dd(inst)
-
-    allow_add = False
-
-    if cur == 0:
-        allow_add = True
-    elif unrealized < 0 and dd >= ADD_THRESHOLD:
-        allow_add = True
-    elif (action == "buy" and cur < 0) or (action == "sell" and cur > 0):
-        # always allow flip
-        allow_add = True
-
-    print("ALLOW:", allow_add, flush=True)
-
-    if not allow_add:
-        return "skip"
-
-    send_delta_order(delta, inst, sl, tp)
-
-    return "ok"
-
-
-# ---------- RUN ----------
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+            tp_price = price + tp if units > 0 else price - tp
+            payload["takeProfit"] =
