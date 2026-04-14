@@ -148,4 +148,83 @@ def send_order(units, inst, sl=None, tp=None):
         # TP
         if tp is not None:
             tp_price = price + tp if units > 0 else price - tp
-            payload["takeProfit"] =
+            payload["takeProfit"] = {"price": str(round(tp_price, 3))}
+
+        if payload:
+            r2 = requests.put(
+                f"{BASE_URL}/accounts/{ACCOUNT}/trades/{trade_id}/orders",
+                headers=headers(),
+                json=payload,
+                timeout=5
+            )
+
+            print("ATTACH:", r2.status_code, r2.text, flush=True)
+
+    except Exception as e:
+        print("ORDER ERROR:", e, flush=True)
+
+
+# ---------- WEBHOOK ----------
+
+@app.route("/", methods=["POST"])
+def webhook():
+    data = request.get_json(force=True)
+    print("\n=== NEW SIGNAL ===", data, flush=True)
+
+    if data.get("key") != SECRET:
+        return "unauthorized", 403
+
+    action = data["action"].lower()
+    size = float(data["size"])
+    inst = data["ticker"].upper()
+
+    sl = parse_float(data.get("sl"))
+    tp = parse_float(data.get("tp"))
+
+    cur = get_position(inst)
+
+    # 🔥 FLIP FIRST
+    if (action == "buy" and cur < 0) or (action == "sell" and cur > 0):
+        print("FLIP DETECTED", flush=True)
+
+        close_all(inst)
+        time.sleep(0.3)
+
+        units = abs(size) if action == "buy" else -abs(size)
+        send_order(units, inst, sl, tp)
+
+        return "flip"
+
+    # 🔥 DD FILTER
+    unrealized, dd = get_instrument_dd(inst)
+
+    allow = False
+
+    if cur == 0:
+        allow = True
+    elif unrealized < 0 and dd >= ADD_THRESHOLD:
+        allow = True
+
+    print("ALLOW:", allow, flush=True)
+
+    if not allow:
+        return "skip"
+
+    # 🔥 STACK (NO TARGET LOGIC)
+    if action == "buy":
+        units = abs(size)
+    elif action == "sell":
+        units = -abs(size)
+    else:
+        return "bad action", 400
+
+    if abs(units) >= MIN_UNITS:
+        send_order(units, inst, sl, tp)
+
+    return "ok"
+
+
+# ---------- RUN ----------
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
