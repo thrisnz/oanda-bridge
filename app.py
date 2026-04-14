@@ -1,5 +1,5 @@
 from flask import Flask, request
-import requests, os, time
+import requests, os
 
 app = Flask(__name__)
 
@@ -42,9 +42,7 @@ def get_position(inst):
 
         for p in r.json().get("positions", []):
             if p["instrument"] == inst:
-                long_units = float(p["long"]["units"])
-                short_units = float(p["short"]["units"])
-                return long_units + short_units
+                return float(p["long"]["units"]) + float(p["short"]["units"])
 
     except Exception as e:
         print("POSITION EXCEPTION:", e, flush=True)
@@ -86,23 +84,6 @@ def get_instrument_dd(inst):
         return 0, 0
 
 
-def close_all(inst):
-    print("CLOSING ALL:", inst, flush=True)
-
-    try:
-        r = requests.put(
-            f"{BASE_URL}/accounts/{ACCOUNT}/positions/{inst}/close",
-            headers=headers(),
-            json={"longUnits": "ALL", "shortUnits": "ALL"},
-            timeout=5
-        )
-
-        print("CLOSE:", r.status_code, r.text, flush=True)
-
-    except Exception as e:
-        print("CLOSE ERROR:", e, flush=True)
-
-
 # ---------- ORDER ----------
 
 def send_order(units, inst, sl=None, tp=None):
@@ -117,7 +98,7 @@ def send_order(units, inst, sl=None, tp=None):
                     "instrument": inst,
                     "units": str(int(units)),
                     "type": "MARKET",
-                    "positionFill": "OPEN_ONLY"
+                    "positionFill": "DEFAULT"   # 🔥 KEY FIX
                 }
             },
             timeout=5
@@ -128,14 +109,17 @@ def send_order(units, inst, sl=None, tp=None):
         if r.status_code != 201:
             return
 
-        fill = r.json().get("orderFillTransaction", {})
-        price = float(fill.get("price", 0))
-        trade_opened = fill.get("tradeOpened")
-
-        if not trade_opened:
-            print("NO TRADE OPENED", flush=True)
+        fill = r.json().get("orderFillTransaction")
+        if not fill:
+            print("NO FILL", flush=True)
             return
 
+        trade_opened = fill.get("tradeOpened")
+        if not trade_opened:
+            print("NO NEW TRADE (likely netting)", flush=True)
+            return
+
+        price = float(fill["price"])
         trade_id = trade_opened["tradeID"]
 
         payload = {}
@@ -183,17 +167,17 @@ def webhook():
 
     cur = get_position(inst)
 
-    # 🔥 FLIP FIRST
-    if (action == "buy" and cur < 0) or (action == "sell" and cur > 0):
-        print("FLIP DETECTED", flush=True)
+    # 🎯 desired position
+    desired = abs(size) if action == "buy" else -abs(size)
 
-        close_all(inst)
-        time.sleep(0.3)
+    # 🎯 delta (this handles EVERYTHING)
+    delta = desired - cur
 
-        units = abs(size) if action == "buy" else -abs(size)
-        send_order(units, inst, sl, tp)
+    print(f"CURRENT={cur} TARGET={desired} DELTA={delta}", flush=True)
 
-        return "flip"
+    if abs(delta) < MIN_UNITS:
+        print("NO CHANGE", flush=True)
+        return "skip"
 
     # 🔥 DD FILTER
     unrealized, dd = get_instrument_dd(inst)
@@ -204,22 +188,15 @@ def webhook():
         allow = True
     elif unrealized < 0 and dd >= ADD_THRESHOLD:
         allow = True
+    elif (action == "buy" and cur < 0) or (action == "sell" and cur > 0):
+        allow = True  # always allow flip
 
     print("ALLOW:", allow, flush=True)
 
     if not allow:
         return "skip"
 
-    # 🔥 STACK (NO TARGET LOGIC)
-    if action == "buy":
-        units = abs(size)
-    elif action == "sell":
-        units = -abs(size)
-    else:
-        return "bad action", 400
-
-    if abs(units) >= MIN_UNITS:
-        send_order(units, inst, sl, tp)
+    send_order(delta, inst, sl, tp)
 
     return "ok"
 
