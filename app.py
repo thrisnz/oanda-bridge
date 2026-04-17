@@ -96,9 +96,10 @@ def send_order(units, inst, sl=None, tp=None):
             json={
                 "order": {
                     "instrument": inst,
-                    "units": str(int(units)),
+                    "units": str(units),  # ✅ no int() truncation
                     "type": "MARKET",
-                    "positionFill": "DEFAULT"   # 🔥 KEY FIX
+                    "timeInForce": "FOK",
+                    "positionFill": "REDUCE_FIRST"  # 🔥 FIXED
                 }
             },
             timeout=5
@@ -115,8 +116,10 @@ def send_order(units, inst, sl=None, tp=None):
             return
 
         trade_opened = fill.get("tradeOpened")
+
+        # 🔥 If just reducing/closing, skip TP/SL attach
         if not trade_opened:
-            print("NO NEW TRADE (likely netting)", flush=True)
+            print("NO NEW TRADE (reduction only)", flush=True)
             return
 
         price = float(fill["price"])
@@ -152,25 +155,36 @@ def send_order(units, inst, sl=None, tp=None):
 
 @app.route("/", methods=["POST"])
 def webhook():
-    data = request.get_json(force=True)
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+    except:
+        data = {}
+
     print("\n=== NEW SIGNAL ===", data, flush=True)
+
+    # 🔴 reject garbage pings
+    if not data or "key" not in data:
+        return "ignored", 200
 
     if data.get("key") != SECRET:
         return "unauthorized", 403
 
-    action = data["action"].lower()
-    size = float(data["size"])
-    inst = data["ticker"].upper()
+    try:
+        action = data["action"].lower()
+        size = float(data["size"])
+        inst = data["ticker"].upper()
+    except:
+        return "bad payload", 400
 
     sl = parse_float(data.get("sl"))
     tp = parse_float(data.get("tp"))
 
     cur = get_position(inst)
 
-    # 🎯 desired position
+    # 🎯 target position
     desired = abs(size) if action == "buy" else -abs(size)
 
-    # 🎯 delta (this handles EVERYTHING)
+    # 🎯 delta
     delta = desired - cur
 
     print(f"CURRENT={cur} TARGET={desired} DELTA={delta}", flush=True)
@@ -179,7 +193,8 @@ def webhook():
         print("NO CHANGE", flush=True)
         return "skip"
 
-    # 🔥 DD FILTER
+    # ---------- DD FILTER ----------
+
     unrealized, dd = get_instrument_dd(inst)
 
     allow = False
@@ -195,6 +210,8 @@ def webhook():
 
     if not allow:
         return "skip"
+
+    # ---------- EXECUTE ----------
 
     send_order(delta, inst, sl, tp)
 
