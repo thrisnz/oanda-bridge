@@ -38,16 +38,17 @@ def get_position(inst):
 
         if r.status_code != 200:
             print("POSITION ERROR:", r.text, flush=True)
-            return 0.0
+            return None  # 🔥 DO NOT assume 0
 
         for p in r.json().get("positions", []):
             if p["instrument"] == inst:
                 return float(p["long"]["units"]) + float(p["short"]["units"])
 
+        return 0.0  # no position
+
     except Exception as e:
         print("POSITION EXCEPTION:", e, flush=True)
-
-    return 0.0
+        return None
 
 
 def get_instrument_dd(inst):
@@ -59,7 +60,6 @@ def get_instrument_dd(inst):
         )
 
         if r.status_code != 200:
-            print("DD ERROR:", r.text, flush=True)
             return 0, 0
 
         trades = [t for t in r.json().get("trades", []) if t["instrument"] == inst]
@@ -96,10 +96,10 @@ def send_order(units, inst, sl=None, tp=None):
             json={
                 "order": {
                     "instrument": inst,
-                    "units": str(units),  # ✅ no int() truncation
+                    "units": str(int(units)),  # WTICO safe
                     "type": "MARKET",
                     "timeInForce": "FOK",
-                    "positionFill": "REDUCE_FIRST"  # 🔥 FIXED
+                    "positionFill": "REDUCE_FIRST"
                 }
             },
             timeout=5
@@ -108,63 +108,56 @@ def send_order(units, inst, sl=None, tp=None):
         print("OANDA:", r.status_code, r.text, flush=True)
 
         if r.status_code != 201:
-            return
+            return False
 
         fill = r.json().get("orderFillTransaction")
         if not fill:
-            print("NO FILL", flush=True)
-            return
+            return False
 
         trade_opened = fill.get("tradeOpened")
 
-        # 🔥 If just reducing/closing, skip TP/SL attach
         if not trade_opened:
-            print("NO NEW TRADE (reduction only)", flush=True)
-            return
+            print("REDUCE ONLY", flush=True)
+            return True
 
         price = float(fill["price"])
         trade_id = trade_opened["tradeID"]
 
         payload = {}
 
-        # SL
         if sl is not None:
             sl_price = price - sl if units > 0 else price + sl
             payload["stopLoss"] = {"price": str(round(sl_price, 3))}
 
-        # TP
         if tp is not None:
             tp_price = price + tp if units > 0 else price - tp
             payload["takeProfit"] = {"price": str(round(tp_price, 3))}
 
         if payload:
-            r2 = requests.put(
+            requests.put(
                 f"{BASE_URL}/accounts/{ACCOUNT}/trades/{trade_id}/orders",
                 headers=headers(),
                 json=payload,
                 timeout=5
             )
 
-            print("ATTACH:", r2.status_code, r2.text, flush=True)
+        return True
 
     except Exception as e:
         print("ORDER ERROR:", e, flush=True)
+        return False
 
 
 # ---------- WEBHOOK ----------
 
 @app.route("/", methods=["POST"])
 def webhook():
-    try:
-        data = request.get_json(force=True, silent=True) or {}
-    except:
-        data = {}
-
+    data = request.get_json(force=True, silent=True) or {}
     print("\n=== NEW SIGNAL ===", data, flush=True)
 
-    # 🔴 reject garbage pings
+    # ignore keep-alive junk
     if not data or "key" not in data:
-        return "ignored", 200
+        return "ignored"
 
     if data.get("key") != SECRET:
         return "unauthorized", 403
@@ -181,10 +174,11 @@ def webhook():
 
     cur = get_position(inst)
 
-    # 🎯 target position
-    desired = abs(size) if action == "buy" else -abs(size)
+    if cur is None:
+        print("POSITION UNKNOWN - ABORT", flush=True)
+        return "fail"
 
-    # 🎯 delta
+    desired = abs(size) if action == "buy" else -abs(size)
     delta = desired - cur
 
     print(f"CURRENT={cur} TARGET={desired} DELTA={delta}", flush=True)
@@ -204,16 +198,36 @@ def webhook():
     elif unrealized < 0 and dd >= ADD_THRESHOLD:
         allow = True
     elif (action == "buy" and cur < 0) or (action == "sell" and cur > 0):
-        allow = True  # always allow flip
+        allow = True
 
     print("ALLOW:", allow, flush=True)
 
     if not allow:
         return "skip"
 
-    # ---------- EXECUTE ----------
+    # ---------- EXECUTION (BULLETPROOF) ----------
 
-    send_order(delta, inst, sl, tp)
+    flip = (cur < 0 and desired > 0) or (cur > 0 and desired < 0)
+
+    if flip:
+        print("FLIP DETECTED", flush=True)
+
+        # try fast flip
+        if not send_order(delta, inst, sl, tp):
+            print("FALLBACK: CLOSE THEN OPEN", flush=True)
+
+            if abs(cur) > 0:
+                if not send_order(-cur, inst):
+                    print("CLOSE FAILED", flush=True)
+                    return "fail"
+
+            if not send_order(desired, inst, sl, tp):
+                print("OPEN FAILED", flush=True)
+                return "fail"
+
+    else:
+        if not send_order(delta, inst, sl, tp):
+            return "fail"
 
     return "ok"
 
