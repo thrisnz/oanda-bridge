@@ -1,20 +1,14 @@
 # ============================================
 # NOTE TO FUTURE SELF:
 #
-# This system uses a TARGET POSITION model.
-# - TradingView sends desired total position (NOT incremental size)
-# - Backend calculates delta = desired - current
+# HYBRID MODEL:
+# - FLIPS use TARGET model (clean reversal)
+# - ADDS use INCREMENTAL model (scaling)
 #
-# CORE RULES:
-# 1. FLIPS are ALWAYS allowed (never blocked by DD)
-# 2. ADDS are ONLY allowed when:
-#    - position is losing
-#    - DD >= ADD_THRESHOLD
-# 3. If delta == 0 → NO ACTION (important!)
-#
-# Common confusion:
-# - Sending same size twice does NOT add (target model)
-# - Must increase size in signal to scale in
+# This avoids:
+# - "DELTA = 0" problem
+# - missed adds
+# - flip blocking due to DD
 #
 # ============================================
 
@@ -28,7 +22,7 @@ API_KEY = os.environ.get("API_KEY")
 SECRET = os.environ.get("SECRET")
 BASE_URL = "https://api-fxtrade.oanda.com/v3"
 
-ADD_THRESHOLD = 0.03   # 3% drawdown (margin-based)
+ADD_THRESHOLD = 0.03
 MIN_UNITS = 1
 
 
@@ -41,30 +35,20 @@ def headers():
     }
 
 
-def parse_float(v):
-    try:
-        return None if v in ("", None) else float(v)
-    except:
-        return None
-
-
 def get_position(inst):
     try:
         r = requests.get(f"{BASE_URL}/accounts/{ACCOUNT}/openPositions", headers=headers(), timeout=5)
 
         if r.status_code != 200:
-            print("POSITION ERROR:", r.text, flush=True)
             return None
 
         for p in r.json().get("positions", []):
             if p["instrument"] == inst:
-                # NOTE: long is +, short is -
                 return float(p["long"]["units"]) + float(p["short"]["units"])
 
         return 0.0
 
-    except Exception as e:
-        print("POSITION EXCEPTION:", e, flush=True)
+    except:
         return None
 
 
@@ -86,21 +70,14 @@ def get_instrument_dd(inst):
         if margin == 0:
             return 0, 0
 
-        # NOTE: DD is relative to margin, NOT account
         dd = abs(unrealized) / margin
-
-        print(f"PL={unrealized} MARGIN={margin} DD={dd:.4f}", flush=True)
-
         return unrealized, dd
 
-    except Exception as e:
-        print("DD EXCEPTION:", e, flush=True)
+    except:
         return 0, 0
 
 
-# ---------- ORDER ----------
-
-def send_order(units, inst, sl=None, tp=None):
+def send_order(units, inst):
     print("SENDING:", units, inst, flush=True)
 
     try:
@@ -113,7 +90,6 @@ def send_order(units, inst, sl=None, tp=None):
                     "units": str(int(units)),
                     "type": "MARKET",
                     "timeInForce": "FOK",
-                    # NOTE: ensures closing before opening (no hedging)
                     "positionFill": "REDUCE_FIRST"
                 }
             },
@@ -121,7 +97,6 @@ def send_order(units, inst, sl=None, tp=None):
         )
 
         print("OANDA:", r.status_code, r.text, flush=True)
-
         return r.status_code == 201
 
     except Exception as e:
@@ -136,95 +111,62 @@ def webhook():
     data = request.get_json(force=True, silent=True) or {}
     print("\n=== NEW SIGNAL ===", data, flush=True)
 
-    # NOTE: ignore empty / health check requests
     if not data or "key" not in data:
         return "ignored"
 
     if data.get("key") != SECRET:
         return "unauthorized", 403
 
-    try:
-        action = data["action"].lower()
-        size = float(data["size"])
-        inst = data["ticker"].upper()
-    except:
-        return "bad payload", 400
-
-    sl = parse_float(data.get("sl"))
-    tp = parse_float(data.get("tp"))
+    action = data["action"].lower()
+    size = float(data["size"])
+    inst = data["ticker"].upper()
 
     cur = get_position(inst)
 
     if cur is None:
-        print("POSITION UNKNOWN - ABORT", flush=True)
+        print("POSITION UNKNOWN")
         return "fail"
 
-    # ===== TARGET MODEL =====
-    desired = abs(size) if action == "buy" else -abs(size)
-    delta = desired - cur
-
-    print(f"CURRENT={cur} TARGET={desired} DELTA={delta}", flush=True)
-
-    # NOTE: if delta == 0 → nothing happens (common confusion)
-    if abs(delta) < MIN_UNITS:
-        print("NO CHANGE", flush=True)
-        return "skip"
-
-    # ===== CONTEXT =====
     same_direction = (action == "buy" and cur > 0) or (action == "sell" and cur < 0)
     flip = (action == "buy" and cur < 0) or (action == "sell" and cur > 0)
 
-    # ===== DD =====
     unrealized, dd = get_instrument_dd(inst)
 
-    # ===== DECISION =====
+    print(f"CURRENT={cur} DD={dd:.4f}", flush=True)
+
+    # ---------- DECISION ----------
+
     if cur == 0:
-        allow = True
+        delta = size if action == "buy" else -size
         reason = "NEW ENTRY"
 
     elif flip:
-        allow = True
-        reason = "FLIP (ALWAYS ALLOWED)"
+        desired = abs(size) if action == "buy" else -abs(size)
+        delta = desired - cur
+        reason = "FLIP (TARGET MODE)"
 
     elif same_direction:
         if unrealized < 0 and dd >= ADD_THRESHOLD:
-            allow = True
-            reason = "ADD (DD OK)"
+            delta = size if action == "buy" else -size
+            reason = "ADD (INCREMENTAL)"
         else:
-            allow = False
-            reason = "ADD BLOCKED"
+            print("ADD BLOCKED")
+            return "skip"
 
     else:
-        allow = False
-        reason = "UNKNOWN BLOCK"
-
-    print("ALLOW:", allow, "|", reason, flush=True)
-
-    if not allow:
         return "skip"
 
-    # ===== EXECUTION =====
-    if flip:
-        print("FLIP EXECUTION", flush=True)
+    if abs(delta) < MIN_UNITS:
+        print("NO CHANGE")
+        return "skip"
 
-        if not send_order(delta, inst, sl, tp):
-            print("FALLBACK: CLOSE THEN OPEN", flush=True)
+    print(f"EXECUTING DELTA={delta} | {reason}", flush=True)
 
-            if abs(cur) > 0:
-                if not send_order(-cur, inst):
-                    return "fail"
-
-            if not send_order(desired, inst, sl, tp):
-                return "fail"
-
-    else:
-        if not send_order(delta, inst, sl, tp):
-            return "fail"
+    if not send_order(delta, inst):
+        return "fail"
 
     return "ok"
 
-
-# ---------- RUN ----------
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
