@@ -1,3 +1,23 @@
+# ============================================
+# NOTE TO FUTURE SELF:
+#
+# This system uses a TARGET POSITION model.
+# - TradingView sends desired total position (NOT incremental size)
+# - Backend calculates delta = desired - current
+#
+# CORE RULES:
+# 1. FLIPS are ALWAYS allowed (never blocked by DD)
+# 2. ADDS are ONLY allowed when:
+#    - position is losing
+#    - DD >= ADD_THRESHOLD
+# 3. If delta == 0 → NO ACTION (important!)
+#
+# Common confusion:
+# - Sending same size twice does NOT add (target model)
+# - Must increase size in signal to scale in
+#
+# ============================================
+
 from flask import Flask, request
 import requests, os
 
@@ -8,7 +28,7 @@ API_KEY = os.environ.get("API_KEY")
 SECRET = os.environ.get("SECRET")
 BASE_URL = "https://api-fxtrade.oanda.com/v3"
 
-ADD_THRESHOLD = 0.03
+ADD_THRESHOLD = 0.03   # 3% drawdown (margin-based)
 MIN_UNITS = 1
 
 
@@ -30,21 +50,18 @@ def parse_float(v):
 
 def get_position(inst):
     try:
-        r = requests.get(
-            f"{BASE_URL}/accounts/{ACCOUNT}/openPositions",
-            headers=headers(),
-            timeout=5
-        )
+        r = requests.get(f"{BASE_URL}/accounts/{ACCOUNT}/openPositions", headers=headers(), timeout=5)
 
         if r.status_code != 200:
             print("POSITION ERROR:", r.text, flush=True)
-            return None  # 🔥 DO NOT assume 0
+            return None
 
         for p in r.json().get("positions", []):
             if p["instrument"] == inst:
+                # NOTE: long is +, short is -
                 return float(p["long"]["units"]) + float(p["short"]["units"])
 
-        return 0.0  # no position
+        return 0.0
 
     except Exception as e:
         print("POSITION EXCEPTION:", e, flush=True)
@@ -53,11 +70,7 @@ def get_position(inst):
 
 def get_instrument_dd(inst):
     try:
-        r = requests.get(
-            f"{BASE_URL}/accounts/{ACCOUNT}/openTrades",
-            headers=headers(),
-            timeout=5
-        )
+        r = requests.get(f"{BASE_URL}/accounts/{ACCOUNT}/openTrades", headers=headers(), timeout=5)
 
         if r.status_code != 200:
             return 0, 0
@@ -73,6 +86,7 @@ def get_instrument_dd(inst):
         if margin == 0:
             return 0, 0
 
+        # NOTE: DD is relative to margin, NOT account
         dd = abs(unrealized) / margin
 
         print(f"PL={unrealized} MARGIN={margin} DD={dd:.4f}", flush=True)
@@ -96,9 +110,10 @@ def send_order(units, inst, sl=None, tp=None):
             json={
                 "order": {
                     "instrument": inst,
-                    "units": str(int(units)),  # WTICO safe
+                    "units": str(int(units)),
                     "type": "MARKET",
                     "timeInForce": "FOK",
+                    # NOTE: ensures closing before opening (no hedging)
                     "positionFill": "REDUCE_FIRST"
                 }
             },
@@ -107,41 +122,7 @@ def send_order(units, inst, sl=None, tp=None):
 
         print("OANDA:", r.status_code, r.text, flush=True)
 
-        if r.status_code != 201:
-            return False
-
-        fill = r.json().get("orderFillTransaction")
-        if not fill:
-            return False
-
-        trade_opened = fill.get("tradeOpened")
-
-        if not trade_opened:
-            print("REDUCE ONLY", flush=True)
-            return True
-
-        price = float(fill["price"])
-        trade_id = trade_opened["tradeID"]
-
-        payload = {}
-
-        if sl is not None:
-            sl_price = price - sl if units > 0 else price + sl
-            payload["stopLoss"] = {"price": str(round(sl_price, 3))}
-
-        if tp is not None:
-            tp_price = price + tp if units > 0 else price - tp
-            payload["takeProfit"] = {"price": str(round(tp_price, 3))}
-
-        if payload:
-            requests.put(
-                f"{BASE_URL}/accounts/{ACCOUNT}/trades/{trade_id}/orders",
-                headers=headers(),
-                json=payload,
-                timeout=5
-            )
-
-        return True
+        return r.status_code == 201
 
     except Exception as e:
         print("ORDER ERROR:", e, flush=True)
@@ -155,7 +136,7 @@ def webhook():
     data = request.get_json(force=True, silent=True) or {}
     print("\n=== NEW SIGNAL ===", data, flush=True)
 
-    # ignore keep-alive junk
+    # NOTE: ignore empty / health check requests
     if not data or "key" not in data:
         return "ignored"
 
@@ -178,51 +159,62 @@ def webhook():
         print("POSITION UNKNOWN - ABORT", flush=True)
         return "fail"
 
+    # ===== TARGET MODEL =====
     desired = abs(size) if action == "buy" else -abs(size)
     delta = desired - cur
 
     print(f"CURRENT={cur} TARGET={desired} DELTA={delta}", flush=True)
 
+    # NOTE: if delta == 0 → nothing happens (common confusion)
     if abs(delta) < MIN_UNITS:
         print("NO CHANGE", flush=True)
         return "skip"
 
-    # ---------- DD FILTER ----------
+    # ===== CONTEXT =====
+    same_direction = (action == "buy" and cur > 0) or (action == "sell" and cur < 0)
+    flip = (action == "buy" and cur < 0) or (action == "sell" and cur > 0)
 
+    # ===== DD =====
     unrealized, dd = get_instrument_dd(inst)
 
-    allow = False
-
+    # ===== DECISION =====
     if cur == 0:
         allow = True
-    elif unrealized < 0 and dd >= ADD_THRESHOLD:
-        allow = True
-    elif (action == "buy" and cur < 0) or (action == "sell" and cur > 0):
-        allow = True
+        reason = "NEW ENTRY"
 
-    print("ALLOW:", allow, flush=True)
+    elif flip:
+        allow = True
+        reason = "FLIP (ALWAYS ALLOWED)"
+
+    elif same_direction:
+        if unrealized < 0 and dd >= ADD_THRESHOLD:
+            allow = True
+            reason = "ADD (DD OK)"
+        else:
+            allow = False
+            reason = "ADD BLOCKED"
+
+    else:
+        allow = False
+        reason = "UNKNOWN BLOCK"
+
+    print("ALLOW:", allow, "|", reason, flush=True)
 
     if not allow:
         return "skip"
 
-    # ---------- EXECUTION (BULLETPROOF) ----------
-
-    flip = (cur < 0 and desired > 0) or (cur > 0 and desired < 0)
-
+    # ===== EXECUTION =====
     if flip:
-        print("FLIP DETECTED", flush=True)
+        print("FLIP EXECUTION", flush=True)
 
-        # try fast flip
         if not send_order(delta, inst, sl, tp):
             print("FALLBACK: CLOSE THEN OPEN", flush=True)
 
             if abs(cur) > 0:
                 if not send_order(-cur, inst):
-                    print("CLOSE FAILED", flush=True)
                     return "fail"
 
             if not send_order(desired, inst, sl, tp):
-                print("OPEN FAILED", flush=True)
                 return "fail"
 
     else:
