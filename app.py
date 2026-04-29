@@ -1,14 +1,31 @@
 # ============================================
-# NOTE TO FUTURE SELF:
+# LOGIC VERSION: HYBRID_v1.1
 #
-# HYBRID MODEL:
-# - FLIPS use TARGET model (clean reversal)
-# - ADDS use INCREMENTAL model (scaling)
+# CHANGE LOG:
+# v1.1 → Restored TP/SL post-fill attachment (CRITICAL FIX)
+# v1.0 → Hybrid model (flip=target, add=incremental)
 #
-# This avoids:
-# - "DELTA = 0" problem
-# - missed adds
-# - flip blocking due to DD
+# ============================================
+# NOTE TO FUTURE SELF (DO NOT REMOVE):
+#
+# CORE MODEL:
+# - FLIP → TARGET MODE (delta = desired - current)
+# - ADD  → INCREMENTAL (ONLY if losing AND DD >= threshold)
+# - NEW  → INCREMENTAL
+#
+# CRITICAL RULES:
+# - Market order is NOT a complete trade
+# - TP/SL MUST be attached AFTER fill using tradeID
+# - If tradeOpened is None → this was reduce/close → DO NOT attach TP
+#
+# DO NOT:
+# - Remove TP logic when modifying execution
+# - Change delta logic without checking flip/add behavior
+#
+# ALWAYS VERIFY AFTER ANY CHANGE:
+# 1. Flip works
+# 2. Add is DD-gated
+# 3. TP is attached
 #
 # ============================================
 
@@ -40,6 +57,7 @@ def get_position(inst):
         r = requests.get(f"{BASE_URL}/accounts/{ACCOUNT}/openPositions", headers=headers(), timeout=5)
 
         if r.status_code != 200:
+            print("POSITION ERROR:", r.text, flush=True)
             return None
 
         for p in r.json().get("positions", []):
@@ -48,7 +66,8 @@ def get_position(inst):
 
         return 0.0
 
-    except:
+    except Exception as e:
+        print("POSITION EXCEPTION:", e, flush=True)
         return None
 
 
@@ -73,11 +92,14 @@ def get_instrument_dd(inst):
         dd = abs(unrealized) / margin
         return unrealized, dd
 
-    except:
+    except Exception as e:
+        print("DD EXCEPTION:", e, flush=True)
         return 0, 0
 
 
-def send_order(units, inst):
+# ---------- ORDER (WITH TP/SL) ----------
+
+def send_order(units, inst, tp=None, sl=None):
     print("SENDING:", units, inst, flush=True)
 
     try:
@@ -97,7 +119,46 @@ def send_order(units, inst):
         )
 
         print("OANDA:", r.status_code, r.text, flush=True)
-        return r.status_code == 201
+
+        if r.status_code != 201:
+            return False
+
+        fill = r.json().get("orderFillTransaction")
+        if not fill:
+            return False
+
+        trade_opened = fill.get("tradeOpened")
+
+        # ===== CRITICAL: ONLY APPLY TP IF NEW TRADE =====
+        if not trade_opened:
+            print("NO NEW TRADE (reduce only)", flush=True)
+            return True
+
+        trade_id = trade_opened["tradeID"]
+        price = float(fill["price"])
+
+        payload = {}
+
+        if tp is not None:
+            tp_price = price + tp if units > 0 else price - tp
+            payload["takeProfit"] = {"price": str(round(tp_price, 3))}
+
+        if sl is not None:
+            sl_price = price - sl if units > 0 else price + sl
+            payload["stopLoss"] = {"price": str(round(sl_price, 3))}
+
+        if payload:
+            requests.put(
+                f"{BASE_URL}/accounts/{ACCOUNT}/trades/{trade_id}/orders",
+                headers=headers(),
+                json=payload,
+                timeout=5
+            )
+            print("TP/SL ATTACHED:", payload, flush=True)
+        else:
+            print("WARNING: NO TP/SL PROVIDED", flush=True)
+
+        return True
 
     except Exception as e:
         print("ORDER ERROR:", e, flush=True)
@@ -110,6 +171,7 @@ def send_order(units, inst):
 def webhook():
     data = request.get_json(force=True, silent=True) or {}
     print("\n=== NEW SIGNAL ===", data, flush=True)
+    print("[VERSION] HYBRID_v1.1", flush=True)
 
     if not data or "key" not in data:
         return "ignored"
@@ -120,6 +182,12 @@ def webhook():
     action = data["action"].lower()
     size = float(data["size"])
     inst = data["ticker"].upper()
+
+    # ===== TP/SL INPUT =====
+    tp = float(data.get("tp")) if data.get("tp") is not None else None
+    sl = float(data.get("sl")) if data.get("sl") is not None else None
+
+    print(f"[INPUT] action={action} size={size} tp={tp}", flush=True)
 
     cur = get_position(inst)
 
@@ -150,23 +218,29 @@ def webhook():
             delta = size if action == "buy" else -size
             reason = "ADD (INCREMENTAL)"
         else:
-            print("ADD BLOCKED")
+            print("ADD BLOCKED", flush=True)
             return "skip"
 
     else:
         return "skip"
 
     if abs(delta) < MIN_UNITS:
-        print("NO CHANGE")
+        print("NO CHANGE", flush=True)
         return "skip"
 
-    print(f"EXECUTING DELTA={delta} | {reason}", flush=True)
+    print(f"[PLAN] delta={delta} | {reason}", flush=True)
 
-    if not send_order(delta, inst):
+    # ===== SAFETY CHECK =====
+    if tp is None:
+        print("WARNING: ORDER HAS NO TP", flush=True)
+
+    if not send_order(delta, inst, tp, sl):
         return "fail"
 
     return "ok"
 
+
+# ---------- RUN ----------
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
