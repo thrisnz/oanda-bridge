@@ -1,26 +1,78 @@
 # HYBRID_v1.1 + SL_ENGINE_v1.0 | SINGLE DYNAMIC SL ONLY
 
-# NOTES:
+# =========================================================
+# NOTES — READ BEFORE TOUCHING ANYTHING
+# =========================================================
+#
 # CORE MODEL:
-# - FLIP = TARGET MODE (delta = desired - current)
-# - ADD  = INCREMENTAL ONLY if losing AND DD >= threshold
-# - NEW  = INCREMENTAL
+# - FLIP = TARGET MODE
+#     → delta = desired_position - current_position
 #
-# CRITICAL:
-# - TP/SL MUST be attached AFTER fill (tradeID)
-# - tradeOpened == None → reduce only → DO NOT attach TP
+# - ADD = INCREMENTAL (ONLY if losing AND DD >= threshold)
 #
-# SL ENGINE:
-# - ONE SL only
-# - BE → LOCK1 → LOCK2
-# - SL ONLY MOVES FORWARD
-# - NO TP (recommended)
+# - NEW = INCREMENTAL (when no position)
 #
-# VERIFY AFTER CHANGES:
-# - flip works
-# - add DD gating works
-# - TP attaches (if used)
-# - SL never moves backward
+# ---------------------------------------------------------
+# CRITICAL EXECUTION RULES:
+#
+# - positionFill = REDUCE_FIRST
+#     → closes opposite trades before opening new ones
+#
+# - tradeOpened == None
+#     → means NO new trade was created (reduce-only)
+#     → DO NOT attach SL / DO NOT register SL engine
+#
+# - ALWAYS trust OANDA response, not assumptions
+#
+# ---------------------------------------------------------
+# SL ENGINE DESIGN:
+#
+# - ONE dynamic SL only (NO multiple SLs)
+#
+# - Ladder structure:
+#
+#     ENTRY
+#       ↓
+#     BE (Break Even)
+#       ↓
+#     LOCK1 (secure partial profit)
+#       ↓
+#     LOCK2 (secure deeper profit)
+#
+# - SL ONLY MOVES FORWARD (never backwards)
+#
+# ---------------------------------------------------------
+# LADDER LEVELS (percentage-based):
+#
+# BE_LEVEL:
+#   → when price moves enough → SL = entry (risk-free)
+#
+# LOCK1:
+#   → further move → lock small profit
+#
+# LOCK2:
+#   → strong move → lock larger profit
+#
+# ---------------------------------------------------------
+# IMPORTANT BEHAVIOR:
+#
+# - Ladder overwrites itself:
+#     LOCK2 overrides LOCK1
+#     LOCK1 overrides BE
+#
+# - No TP required for system to function
+#   (SL acts as profit capture)
+#
+# ---------------------------------------------------------
+# VERIFY AFTER ANY CHANGE:
+#
+# ✔ flip logic works
+# ✔ add DD gating works
+# ✔ trades register correctly
+# ✔ SL updates forward only
+# ✔ logs visible in Render
+#
+# =========================================================
 
 from flask import Flask, request
 import requests, os, threading, time
@@ -39,6 +91,7 @@ MIN_UNITS = 1
 
 SL_ENABLED = True
 
+# tuned for faster scalping behavior
 BE_LEVEL    = 0.0015
 LOCK1_TRIG  = 0.0035
 LOCK1_LOCK  = 0.0022
@@ -57,18 +110,21 @@ def get_position(inst):
     try:
         r = requests.get(f"{BASE_URL}/accounts/{ACCOUNT}/openPositions", headers=headers(), timeout=5)
         if r.status_code != 200:
+            print("POSITION ERROR:", r.text, flush=True)
             return None
         for p in r.json().get("positions", []):
             if p["instrument"] == inst:
                 return float(p["long"]["units"]) + float(p["short"]["units"])
         return 0.0
-    except:
+    except Exception as e:
+        print("POSITION EXCEPTION:", e, flush=True)
         return None
 
 def get_instrument_dd(inst):
     try:
         r = requests.get(f"{BASE_URL}/accounts/{ACCOUNT}/openTrades", headers=headers(), timeout=5)
         if r.status_code != 200:
+            print("DD ERROR:", r.text, flush=True)
             return 0, 0
         trades = [t for t in r.json().get("trades", []) if t["instrument"] == inst]
         if not trades:
@@ -78,12 +134,14 @@ def get_instrument_dd(inst):
         if margin == 0:
             return 0, 0
         return unrealized, abs(unrealized) / margin
-    except:
+    except Exception as e:
+        print("DD EXCEPTION:", e, flush=True)
         return 0, 0
 
 # ===== SL ENGINE =====
 
 def register_trade(trade_id, units, price, inst):
+    print(f"[REGISTER] {trade_id} @ {price}", flush=True)
     sl_trades[trade_id] = {
         "inst": inst,
         "side": 1 if units > 0 else -1,
@@ -97,6 +155,7 @@ def update_sl(trade_id, trade, new_sl):
     current_sl = trade["sl"]
     side = trade["side"]
 
+    # prevent backward movement
     if current_sl is not None:
         if side == 1 and new_sl <= current_sl:
             return
@@ -122,6 +181,8 @@ def process_trade(trade_id, trade, price):
     side = trade["side"]
 
     move = (price - entry) / entry * side
+
+    print(f"[SL CHECK] move={move:.5f}", flush=True)
 
     new_sl = None
 
@@ -170,9 +231,11 @@ def sl_loop():
 
         time.sleep(1)
 
-# ===== ORDER (PROTECTED) =====
+# ===== ORDER =====
 
 def send_order(units, inst, tp=None, sl=None):
+
+    print("SENDING:", units, inst, flush=True)
 
     try:
         r = requests.post(
@@ -190,6 +253,8 @@ def send_order(units, inst, tp=None, sl=None):
             timeout=5
         )
 
+        print("OANDA:", r.status_code, r.text, flush=True)
+
         if r.status_code != 201:
             return False
 
@@ -200,6 +265,7 @@ def send_order(units, inst, tp=None, sl=None):
         trade_opened = fill.get("tradeOpened")
 
         if not trade_opened:
+            print("NO NEW TRADE", flush=True)
             return True
 
         trade_id = trade_opened["tradeID"]
@@ -208,27 +274,10 @@ def send_order(units, inst, tp=None, sl=None):
         if SL_ENABLED:
             register_trade(trade_id, units, price, inst)
 
-        payload = {}
-
-        if tp is not None:
-            tp_price = price + tp if units > 0 else price - tp
-            payload["takeProfit"] = {"price": str(round(tp_price, 3))}
-
-        if sl is not None:
-            sl_price = price - sl if units > 0 else price + sl
-            payload["stopLoss"] = {"price": str(round(sl_price, 3))}
-
-        if payload:
-            requests.put(
-                f"{BASE_URL}/accounts/{ACCOUNT}/trades/{trade_id}/orders",
-                headers=headers(),
-                json=payload,
-                timeout=5
-            )
-
         return True
 
-    except:
+    except Exception as e:
+        print("ORDER ERROR:", e, flush=True)
         return False
 
 # ===== WEBHOOK =====
@@ -237,15 +286,15 @@ def send_order(units, inst, tp=None, sl=None):
 def webhook():
     data = request.get_json(force=True, silent=True) or {}
 
+    print("\n=== NEW SIGNAL ===", data, flush=True)
+
     if not data or data.get("key") != SECRET:
+        print("AUTH FAILED", flush=True)
         return "unauthorized", 403
 
     action = data["action"].lower()
     size = float(data["size"])
     inst = data["ticker"].upper()
-
-    tp = float(data.get("tp")) if data.get("tp") is not None else None
-    sl = float(data.get("sl")) if data.get("sl") is not None else None
 
     cur = get_position(inst)
     if cur is None:
@@ -265,14 +314,18 @@ def webhook():
         if unrealized < 0 and dd >= ADD_THRESHOLD:
             delta = size if action == "buy" else -size
         else:
+            print("SKIP SAME DIRECTION", flush=True)
             return "skip"
     else:
         return "skip"
 
+    print(f"[PLAN] delta={delta}", flush=True)
+
     if abs(delta) < MIN_UNITS:
+        print("SKIP MIN UNITS", flush=True)
         return "skip"
 
-    if not send_order(delta, inst, tp, sl):
+    if not send_order(delta, inst):
         return "fail"
 
     return "ok"
