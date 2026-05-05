@@ -39,7 +39,7 @@ MIN_UNITS = 1
 
 SL_ENABLED = True
 
-BE_LEVEL    = 0.0033   # ~$15
+BE_LEVEL    = 0.0018 # ~$15
 LOCK1_TRIG  = 0.0066   # ~$30
 LOCK1_LOCK  = 0.0044   # ~$20
 LOCK2_TRIG  = 0.0155   # ~$70
