@@ -1,4 +1,4 @@
-# HYBRID_v1.1 + BE_v1.0 | DO NOT MODIFY PROTECTED ZONES WITHOUT READING NOTES
+# HYBRID_v1.1 + SL_ENGINE_v1.0 | SINGLE DYNAMIC SL ONLY
 
 # NOTES:
 # CORE MODEL:
@@ -10,22 +10,17 @@
 # - TP/SL MUST be attached AFTER fill (tradeID)
 # - tradeOpened == None → reduce only → DO NOT attach TP
 #
-# DO NOT TOUCH:
-# - send_order execution flow
-# - TP/SL logic
-# - delta logic
+# SL ENGINE:
+# - ONE SL only
+# - BE → LOCK1 → LOCK2
+# - SL ONLY MOVES FORWARD
+# - NO TP (recommended)
 #
 # VERIFY AFTER CHANGES:
 # - flip works
 # - add DD gating works
-# - TP attaches
-#
-# BE NOTES:
-# - ARM ≈ 0.08%
-# - MIN_RUN ≈ 0.16%
-# - RETRACE 25%
-# - BE isolated from execution
-# - disable via BE_ENABLED = False
+# - TP attaches (if used)
+# - SL never moves backward
 
 from flask import Flask, request
 import requests, os, threading, time
@@ -40,17 +35,20 @@ BASE_URL = "https://api-fxtrade.oanda.com/v3"
 ADD_THRESHOLD = 0.03
 MIN_UNITS = 1
 
-# ===== BE CONFIG =====
-BE_ENABLED = True
-ARM_TRIGGER = 0.0008
-MIN_RUN = 0.0012
-RETRACE = 0.25
-OFFSET = 0.5
+# ===== SL ENGINE CONFIG =====
 
-be_trades = {}
-BE_INSTRUMENTS = set()
+SL_ENABLED = True
 
-# ===== HELPERS (PROTECTED) =====
+BE_LEVEL    = 0.0033   # ~$15
+LOCK1_TRIG  = 0.0066   # ~$30
+LOCK1_LOCK  = 0.0044   # ~$20
+LOCK2_TRIG  = 0.0155   # ~$70
+LOCK2_LOCK  = 0.0110   # ~$50
+
+sl_trades = {}
+SL_INSTRUMENTS = set()
+
+# ===== HELPERS =====
 
 def headers():
     return {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
@@ -59,14 +57,12 @@ def get_position(inst):
     try:
         r = requests.get(f"{BASE_URL}/accounts/{ACCOUNT}/openPositions", headers=headers(), timeout=5)
         if r.status_code != 200:
-            print("POSITION ERROR:", r.text, flush=True)
             return None
         for p in r.json().get("positions", []):
             if p["instrument"] == inst:
                 return float(p["long"]["units"]) + float(p["short"]["units"])
         return 0.0
-    except Exception as e:
-        print("POSITION EXCEPTION:", e, flush=True)
+    except:
         return None
 
 def get_instrument_dd(inst):
@@ -81,84 +77,80 @@ def get_instrument_dd(inst):
         margin = sum(float(t["marginUsed"]) for t in trades)
         if margin == 0:
             return 0, 0
-        dd = abs(unrealized) / margin
-        return unrealized, dd
-    except Exception as e:
-        print("DD EXCEPTION:", e, flush=True)
+        return unrealized, abs(unrealized) / margin
+    except:
         return 0, 0
 
-# ===== BREAKEVEN ENGINE =====
+# ===== SL ENGINE =====
 
-def register_be_trade(trade_id, units, price, inst):
-    be_trades[trade_id] = {
+def register_trade(trade_id, units, price, inst):
+    sl_trades[trade_id] = {
         "inst": inst,
-        "side": "buy" if units > 0 else "sell",
+        "side": 1 if units > 0 else -1,
         "entry": price,
-        "armed": False,
-        "best": price,
-        "done": False
+        "sl": None
     }
-    BE_INSTRUMENTS.add(inst)
+    SL_INSTRUMENTS.add(inst)
 
-def update_sl(trade_id, price):
+def update_sl(trade_id, trade, new_sl):
+
+    current_sl = trade["sl"]
+    side = trade["side"]
+
+    if current_sl is not None:
+        if side == 1 and new_sl <= current_sl:
+            return
+        if side == -1 and new_sl >= current_sl:
+            return
+
     try:
         requests.put(
             f"{BASE_URL}/accounts/{ACCOUNT}/trades/{trade_id}/orders",
             headers=headers(),
-            json={"stopLoss": {"price": str(round(price, 3))}},
+            json={"stopLoss": {"price": str(round(new_sl, 3))}},
             timeout=5
         )
-        print("[BE] SL →", price, flush=True)
-    except Exception as e:
-        print("[BE ERROR]", e, flush=True)
+        trade["sl"] = new_sl
+        print("[SL UPDATE] →", new_sl, flush=True)
 
-def process_be(trade_id, trade, price):
-    if trade["done"]:
-        return
+    except Exception as e:
+        print("[SL ERROR]", e, flush=True)
+
+def process_trade(trade_id, trade, price):
 
     entry = trade["entry"]
+    side = trade["side"]
 
-    if trade["side"] == "buy":
-        move = (price - entry) / entry
+    move = (price - entry) / entry * side
 
-        if not trade["armed"] and move >= ARM_TRIGGER:
-            trade["armed"] = True
+    new_sl = None
 
-        if trade["armed"]:
-            trade["best"] = max(trade["best"], price)
-            run = (trade["best"] - entry) / entry
-            retrace = (trade["best"] - price) / entry
+    # BE
+    if move >= BE_LEVEL:
+        new_sl = entry
 
-            if run >= MIN_RUN and retrace >= RETRACE * run:
-                update_sl(trade_id, entry + OFFSET)
-                trade["done"] = True
+    # LOCK1
+    if move >= LOCK1_TRIG:
+        new_sl = entry * (1 + LOCK1_LOCK * side)
 
-    else:
-        move = (entry - price) / entry
+    # LOCK2
+    if move >= LOCK2_TRIG:
+        new_sl = entry * (1 + LOCK2_LOCK * side)
 
-        if not trade["armed"] and move >= ARM_TRIGGER:
-            trade["armed"] = True
+    if new_sl is not None:
+        update_sl(trade_id, trade, new_sl)
 
-        if trade["armed"]:
-            trade["best"] = min(trade["best"], price)
-            run = (entry - trade["best"]) / entry
-            retrace = (price - trade["best"]) / entry
-
-            if run >= MIN_RUN and retrace >= RETRACE * run:
-                update_sl(trade_id, entry - OFFSET)
-                trade["done"] = True
-
-def be_loop():
+def sl_loop():
     while True:
         try:
-            if not BE_INSTRUMENTS:
+            if not SL_INSTRUMENTS:
                 time.sleep(1)
                 continue
 
             r = requests.get(
                 f"{BASE_URL}/accounts/{ACCOUNT}/pricing",
                 headers=headers(),
-                params={"instruments": ",".join(BE_INSTRUMENTS)},
+                params={"instruments": ",".join(SL_INSTRUMENTS)},
                 timeout=5
             )
 
@@ -169,19 +161,18 @@ def be_loop():
                     ask = float(p["asks"][0]["price"])
                     mid = (bid + ask) / 2
 
-                    for tid, trade in list(be_trades.items()):
+                    for tid, trade in list(sl_trades.items()):
                         if trade["inst"] == inst:
-                            process_be(tid, trade, mid)
+                            process_trade(tid, trade, mid)
 
         except Exception as e:
-            print("[BE LOOP ERROR]", e, flush=True)
+            print("[SL LOOP ERROR]", e, flush=True)
 
         time.sleep(1)
 
 # ===== ORDER (PROTECTED) =====
 
 def send_order(units, inst, tp=None, sl=None):
-    print("SENDING:", units, inst, flush=True)
 
     try:
         r = requests.post(
@@ -199,8 +190,6 @@ def send_order(units, inst, tp=None, sl=None):
             timeout=5
         )
 
-        print("OANDA:", r.status_code, r.text, flush=True)
-
         if r.status_code != 201:
             return False
 
@@ -211,14 +200,13 @@ def send_order(units, inst, tp=None, sl=None):
         trade_opened = fill.get("tradeOpened")
 
         if not trade_opened:
-            print("NO NEW TRADE", flush=True)
             return True
 
         trade_id = trade_opened["tradeID"]
         price = float(fill["price"])
 
-        if BE_ENABLED:
-            register_be_trade(trade_id, units, price, inst)
+        if SL_ENABLED:
+            register_trade(trade_id, units, price, inst)
 
         payload = {}
 
@@ -237,15 +225,13 @@ def send_order(units, inst, tp=None, sl=None):
                 json=payload,
                 timeout=5
             )
-            print("TP/SL ATTACHED", payload, flush=True)
 
         return True
 
-    except Exception as e:
-        print("ORDER ERROR:", e, flush=True)
+    except:
         return False
 
-# ===== WEBHOOK (PROTECTED) =====
+# ===== WEBHOOK =====
 
 @app.route("/", methods=["POST"])
 def webhook():
@@ -293,8 +279,8 @@ def webhook():
 
 # ===== RUN =====
 
-if BE_ENABLED:
-    threading.Thread(target=be_loop, daemon=True).start()
+if SL_ENABLED:
+    threading.Thread(target=sl_loop, daemon=True).start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
