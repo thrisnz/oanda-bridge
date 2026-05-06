@@ -1,46 +1,89 @@
 # =====================================================================
-# HYBRID_v1.3 + SL_ENGINE_v1.2 | INITIAL SL + DYNAMIC LADDER (CALIBRATED)
+# HYBRID_v1.4 + SL_ENGINE_v1.3 | TRUE P/L LADDER (FINAL)
 # =====================================================================
 
 # ========================= CORE MODEL ===============================
-# (unchanged)
+# TRADE TYPES:
+# - NEW  → open fresh position
+# - ADD  → add ONLY when losing AND DD >= threshold
+# - FLIP → full reversal using TARGET MODE (delta = desired - current)
+#
+# TARGET MODE (CRITICAL):
+# - delta = desired_position - current_position
+# - ensures full reversal in ONE order
+# - relies on: positionFill = REDUCE_FIRST
+#
+# POSITION RULES:
+# - NO hedging
+# - ONE net position per instrument
+# - ALWAYS operate via delta
+
+# ========================= EXECUTION RULES ==========================
+# ORDER FLOW:
+# - send MARKET order
+# - wait for fill
+# - ONLY attach SL AFTER tradeOpened exists
+# - tradeOpened == None → reduce only → DO NOT attach SL
+#
+# OANDA BEHAVIOR:
+# - REDUCE_FIRST:
+#     → closes opposite trades first
+#     → then opens remainder
 
 # ========================= SL SYSTEM ================================
 # TWO LAYERS:
 #
 # 1. INITIAL SL (HARD FLOOR)
 #    - applied immediately after trade opens
+#    - protects against instant adverse move
 #
-# 2. DYNAMIC SL ENGINE (PERCENT-BASED, PRICE-CALIBRATED)
+# 2. DYNAMIC SL ENGINE (TRUE P/L BASED)
 #    - BE → LOCK1 → LOCK2 → LOCK3
-#    - calibrated to behave like:
-#        BE ≈ $10 move
-#        LOCK1 ≈ $30 move
-#        LOCK2 ≈ $70 move
-#        LOCK3 ≈ $110 move
-#
-#    - SL ONLY MOVES FORWARD
-#    - each stage overwrites previous
+#    - TRIGGERED by REAL unrealized P/L (NOT %)
+#    - SL placement remains PRICE-BASED (broker requirement)
 #
 # ========================= LADDER LOGIC =============================
 # BE:
-#   move >= BE_LEVEL → SL = entry ± buffer (NOT exact BE)
+#   unrealizedPL >= $10 → SL = entry ± buffer (~-$3)
 #
 # LOCK1:
-#   move >= LOCK1_TRIG → SL = entry + LOCK1_LOCK
+#   unrealizedPL >= $30 → SL locks ~$20 profit
 #
 # LOCK2:
-#   move >= LOCK2_TRIG → SL = entry + LOCK2_LOCK
+#   unrealizedPL >= $70 → SL locks ~$50 profit
 #
 # LOCK3:
-#   move >= LOCK3_TRIG → SL = entry + LOCK3_LOCK
+#   unrealizedPL >= $110 → SL locks ~$80 profit
 #
+# NOTE:
+# - SL ONLY MOVES FORWARD (never backward)
+# - later stages overwrite earlier ones automatically
+
+# ========================= PRICING ==============================
+# BUY  → use BID
+# SELL → use ASK
+#
+# NOT MID
+# because execution happens on bid/ask, not midpoint
+
 # ========================= KEY INSIGHT ==============================
-# - System uses % move, NOT $ directly
-# - Values are calibrated to XAU (~4600–4700 range)
-# - This preserves scaling while matching $ intuition
+# - OLD SYSTEM: trigger = % move (caused mismatch vs P/L)
+# - NEW SYSTEM: trigger = REAL P/L → matches what you see on screen
+# - eliminates: “$20 profit but no SL shift” issue
 #
+# ========================= PERFORMANCE ==============================
+# - 1x pricing call per loop
+# - 1x openTrades call per loop (for P/L)
+# - loop interval: 1 second
+#
+# ========================= VERIFY AFTER DEPLOY ======================
+# ✔ initial SL appears immediately
+# ✔ BE triggers around +$10
+# ✔ locks trigger at correct P/L levels
+# ✔ SL only moves forward
+# ✔ no missing protection
 # =====================================================================
+
 
 from flask import Flask, request
 import requests, os, threading, time
@@ -58,20 +101,6 @@ MIN_UNITS = 1
 # ===== SL ENGINE CONFIG =====
 
 SL_ENABLED = True
-
-# ---- CALIBRATED LADDER (XAU ~4650) ----
-
-BE_LEVEL    = 0.0022   # ~ $10 move
-BE_BUFFER   = 0.0007   # ~ $3 cushion (prevents premature stop)
-
-LOCK1_TRIG  = 0.0065   # ~ $30 move
-LOCK1_LOCK  = 0.0043   # lock ~ $20
-
-LOCK2_TRIG  = 0.0150   # ~ $70 move
-LOCK2_LOCK  = 0.0105   # lock ~ $50
-
-LOCK3_TRIG  = 0.0235   # ~ $110 move
-LOCK3_LOCK  = 0.0180   # lock ~ $80
 
 sl_trades = {}
 SL_INSTRUMENTS = set()
@@ -126,6 +155,7 @@ def update_sl(trade_id, trade, new_sl):
     current_sl = trade["sl"]
     side = trade["side"]
 
+    # ===== FORWARD-ONLY PROTECTION =====
     if current_sl is not None:
         if side == 1 and new_sl <= current_sl:
             return
@@ -144,29 +174,29 @@ def update_sl(trade_id, trade, new_sl):
     except Exception as e:
         print("[SL ERROR]", e, flush=True)
 
-def process_trade(trade_id, trade, price):
+def process_trade(trade_id, trade, price, pl):
     entry = trade["entry"]
     side = trade["side"]
 
-    move = (price - entry) / entry * side
-
     new_sl = None
 
-    # ===== BE (with buffer, NOT exact entry) =====
-    if move >= BE_LEVEL:
-        new_sl = entry * (1 - BE_BUFFER * side)
+    # ===== TRUE P/L LADDER =====
 
-    # ===== LOCK1 (~$30) =====
-    if move >= LOCK1_TRIG:
-        new_sl = entry * (1 + LOCK1_LOCK * side)
+    # BE (with buffer ~ -$3)
+    if pl >= 10:
+        new_sl = entry * (1 - (3 / entry) * side)
 
-    # ===== LOCK2 (~$70) =====
-    if move >= LOCK2_TRIG:
-        new_sl = entry * (1 + LOCK2_LOCK * side)
+    # LOCK1 (~$30 → lock ~$20)
+    if pl >= 30:
+        new_sl = entry * (1 + (20 / entry) * side)
 
-    # ===== LOCK3 (~$110) =====
-    if move >= LOCK3_TRIG:
-        new_sl = entry * (1 + LOCK3_LOCK * side)
+    # LOCK2 (~$70 → lock ~$50)
+    if pl >= 70:
+        new_sl = entry * (1 + (50 / entry) * side)
+
+    # LOCK3 (~$110 → lock ~$80)
+    if pl >= 110:
+        new_sl = entry * (1 + (80 / entry) * side)
 
     if new_sl is not None:
         update_sl(trade_id, trade, new_sl)
@@ -178,6 +208,20 @@ def sl_loop():
                 time.sleep(1)
                 continue
 
+            # ===== GET LIVE TRADES (P/L + CLEANUP) =====
+            trades_map = {}
+
+            r_trades = requests.get(
+                f"{BASE_URL}/accounts/{ACCOUNT}/openTrades",
+                headers=headers(),
+                timeout=5
+            )
+
+            if r_trades.status_code == 200:
+                for t in r_trades.json()["trades"]:
+                    trades_map[t["id"]] = float(t["unrealizedPL"])
+
+            # ===== GET PRICES =====
             r = requests.get(
                 f"{BASE_URL}/accounts/{ACCOUNT}/pricing",
                 headers=headers(),
@@ -192,13 +236,134 @@ def sl_loop():
                     ask = float(p["asks"][0]["price"])
 
                     for tid, trade in list(sl_trades.items()):
+
+                        # REMOVE CLOSED TRADES
+                        if tid not in trades_map:
+                            sl_trades.pop(tid, None)
+                            continue
+
                         if trade["inst"] == inst:
                             price = bid if trade["side"] == 1 else ask
-                            process_trade(tid, trade, price)
+                            pl = trades_map.get(tid, 0)
+
+                            process_trade(tid, trade, price, pl)
 
         except Exception as e:
             print("[SL LOOP ERROR]", e, flush=True)
 
         time.sleep(1)
 
-# ===== ORDER + WEBHOOK + RUN (UNCHANGED) =====
+# ===== ORDER =====
+
+def send_order(units, inst, sl=None):
+    print("SENDING:", units, inst, flush=True)
+
+    try:
+        r = requests.post(
+            f"{BASE_URL}/accounts/{ACCOUNT}/orders",
+            headers=headers(),
+            json={
+                "order": {
+                    "instrument": inst,
+                    "units": str(int(units)),
+                    "type": "MARKET",
+                    "timeInForce": "FOK",
+                    "positionFill": "REDUCE_FIRST"
+                }
+            },
+            timeout=5
+        )
+
+        print("OANDA:", r.status_code, r.text, flush=True)
+
+        if r.status_code != 201:
+            return False
+
+        fill = r.json().get("orderFillTransaction")
+        if not fill:
+            return False
+
+        trade_opened = fill.get("tradeOpened")
+        if not trade_opened:
+            return True
+
+        trade_id = trade_opened["tradeID"]
+        price = float(fill["price"])
+
+        register_trade(trade_id, units, price, inst)
+
+        # ===== INITIAL SL =====
+        if sl is not None:
+            if units > 0:
+                sl_price = price - sl
+            else:
+                sl_price = price + sl
+
+            try:
+                requests.put(
+                    f"{BASE_URL}/accounts/{ACCOUNT}/trades/{trade_id}/orders",
+                    headers=headers(),
+                    json={"stopLoss": {"price": str(round(sl_price, 3))}},
+                    timeout=5
+                )
+                print("[INIT SL] →", sl_price, flush=True)
+            except Exception as e:
+                print("[INIT SL ERROR]", e, flush=True)
+
+        return True
+
+    except Exception as e:
+        print("ORDER ERROR:", e, flush=True)
+        return False
+
+# ===== WEBHOOK =====
+
+@app.route("/", methods=["POST"])
+def webhook():
+    data = request.get_json(force=True, silent=True) or {}
+
+    if not data or data.get("key") != SECRET:
+        return "unauthorized", 403
+
+    action = data["action"].lower()
+    size = float(data["size"])
+    inst = data["ticker"].upper()
+    sl = float(data.get("sl")) if data.get("sl") is not None else None
+
+    cur = get_position(inst)
+    if cur is None:
+        return "fail"
+
+    same_direction = (action == "buy" and cur > 0) or (action == "sell" and cur < 0)
+    flip = (action == "buy" and cur < 0) or (action == "sell" and cur > 0)
+
+    unrealized, dd = get_instrument_dd(inst)
+
+    if cur == 0:
+        delta = size if action == "buy" else -size
+    elif flip:
+        desired = abs(size) if action == "buy" else -abs(size)
+        delta = desired - cur
+    elif same_direction:
+        if unrealized < 0 and dd >= ADD_THRESHOLD:
+            delta = size if action == "buy" else -size
+        else:
+            return "skip"
+    else:
+        return "skip"
+
+    if abs(delta) < MIN_UNITS:
+        return "skip"
+
+    if not send_order(delta, inst, sl):
+        return "fail"
+
+    return "ok"
+
+# ===== RUN =====
+
+if SL_ENABLED:
+    threading.Thread(target=sl_loop, daemon=True).start()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
