@@ -1,5 +1,5 @@
 # =====================================================================
-# HYBRID_v1.1 + SL_ENGINE_v1.0 | SINGLE DYNAMIC SL ONLY (PRODUCTION)
+# HYBRID_v1.2 + SL_ENGINE_v1.1 | INITIAL SL + DYNAMIC LADDER
 # =====================================================================
 
 # ========================= CORE MODEL ===============================
@@ -23,77 +23,62 @@
 # - send MARKET order
 # - wait for fill
 # - ONLY attach SL AFTER tradeOpened exists
-# - tradeOpened == None → reduce only → DO NOT attach SL/TP
+# - tradeOpened == None → reduce only → DO NOT attach SL
 #
 # OANDA BEHAVIOR:
 # - REDUCE_FIRST:
 #     → closes opposite trades first
 #     → then opens remainder
 
-# ========================= SL ENGINE ================================
-# SINGLE STOP LOSS SYSTEM
+# ========================= SL SYSTEM ================================
+# TWO LAYERS:
 #
-# - ONE SL per trade
-# - SL ONLY MOVES FORWARD (never backward)
-# - NO TP required (SL captures profit)
+# 1. INITIAL SL (HARD FLOOR)
+#    - applied immediately after trade opens
+#    - protects against instant adverse move
 #
-# LADDER:
-#   ENTRY → BE → LOCK1 → LOCK2
-#
+# 2. DYNAMIC SL ENGINE
+#    - BE → LOCK1 → LOCK2
+#    - ONLY moves SL forward (never backward)
+#    - overrides initial SL as trade moves in profit
+
+# ========================= LADDER LOGIC =============================
 # BE:
-#   SL = entry (risk free)
+#   move >= BE_LEVEL → SL = entry
 #
 # LOCK1:
-#   lock small profit
+#   move >= LOCK1_TRIG → SL = entry + LOCK1_LOCK
 #
 # LOCK2:
-#   lock larger profit
+#   move >= LOCK2_TRIG → SL = entry + LOCK2_LOCK
 #
-# IMPORTANT:
-# - later stages overwrite earlier
-# - enforced in update_sl()
+# NOTE:
+# later stages overwrite earlier ones automatically
 
-# ========================= LEVEL CONFIG =============================
-# Percentage move relative to entry
-#
-# BE_LEVEL:
-#   early protection (~$7–10)
-#
-# LOCK1:
-#   ~first meaningful lock (~$15–20)
-#
-# LOCK2:
-#   ~second lock (~$30–35)
-#
-# Tune per volatility
-
-# ========================= CRITICAL FIX =============================
-# MUST use executable price:
-#
+# ========================= PRICING FIX ==============================
 # BUY  → use BID
 # SELL → use ASK
 #
 # NOT MID
+# because execution happens on bid/ask, not midpoint
+
+# ========================= RISK PROFILE =============================
+# BEFORE BE:
+#   protected by INITIAL SL
 #
-# Reason:
-# - exit happens at bid/ask, not mid
-# - using mid delays SL triggers
+# AFTER BE:
+#   risk-free (SL = entry)
+#
+# AFTER LOCKS:
+#   profit locked progressively
 
-# ========================= RISK NOTES ===============================
-# - No initial SL until BE triggers → exposure exists
-# - SL engine updates every 1s
-# - price spikes between loops possible
-# - consider adding initial SL if needed
-
-# ========================= VERIFY ===============================
-# After deploy:
-# ✔ flip works
-# ✔ add gating works
-# ✔ SL moves forward only
+# ========================= VERIFY AFTER DEPLOY ======================
+# ✔ initial SL appears immediately
 # ✔ BE triggers correctly
-# ✔ logs visible
-
+# ✔ SL only moves forward
+# ✔ no missing protection
 # =====================================================================
+
 
 from flask import Flask, request
 import requests, os, threading, time
@@ -130,21 +115,19 @@ def get_position(inst):
     try:
         r = requests.get(f"{BASE_URL}/accounts/{ACCOUNT}/openPositions", headers=headers(), timeout=5)
         if r.status_code != 200:
-            print("POSITION ERROR:", r.text, flush=True)
             return None
         for p in r.json().get("positions", []):
             if p["instrument"] == inst:
                 return float(p["long"]["units"]) + float(p["short"]["units"])
         return 0.0
     except Exception as e:
-        print("POSITION EXCEPTION:", e, flush=True)
+        print("POSITION ERROR:", e, flush=True)
         return None
 
 def get_instrument_dd(inst):
     try:
         r = requests.get(f"{BASE_URL}/accounts/{ACCOUNT}/openTrades", headers=headers(), timeout=5)
         if r.status_code != 200:
-            print("DD ERROR:", r.text, flush=True)
             return 0, 0
         trades = [t for t in r.json().get("trades", []) if t["instrument"] == inst]
         if not trades:
@@ -154,8 +137,7 @@ def get_instrument_dd(inst):
         if margin == 0:
             return 0, 0
         return unrealized, abs(unrealized) / margin
-    except Exception as e:
-        print("DD EXCEPTION:", e, flush=True)
+    except:
         return 0, 0
 
 # ===== SL ENGINE =====
@@ -174,7 +156,6 @@ def update_sl(trade_id, trade, new_sl):
     current_sl = trade["sl"]
     side = trade["side"]
 
-    # forward-only enforcement
     if current_sl is not None:
         if side == 1 and new_sl <= current_sl:
             return
@@ -235,7 +216,6 @@ def sl_loop():
 
                     for tid, trade in list(sl_trades.items()):
                         if trade["inst"] == inst:
-                            # CRITICAL FIX: use executable price
                             price = bid if trade["side"] == 1 else ask
                             process_trade(tid, trade, price)
 
@@ -246,7 +226,7 @@ def sl_loop():
 
 # ===== ORDER =====
 
-def send_order(units, inst, tp=None, sl=None):
+def send_order(units, inst, sl=None):
     print("SENDING:", units, inst, flush=True)
 
     try:
@@ -275,16 +255,30 @@ def send_order(units, inst, tp=None, sl=None):
             return False
 
         trade_opened = fill.get("tradeOpened")
-
         if not trade_opened:
-            print("NO NEW TRADE", flush=True)
             return True
 
         trade_id = trade_opened["tradeID"]
         price = float(fill["price"])
 
-        if SL_ENABLED:
-            register_trade(trade_id, units, price, inst)
+        register_trade(trade_id, units, price, inst)
+
+        if sl is not None:
+            if units > 0:
+                sl_price = price - sl
+            else:
+                sl_price = price + sl
+
+            try:
+                requests.put(
+                    f"{BASE_URL}/accounts/{ACCOUNT}/trades/{trade_id}/orders",
+                    headers=headers(),
+                    json={"stopLoss": {"price": str(round(sl_price, 3))}},
+                    timeout=5
+                )
+                print("[INIT SL] →", sl_price, flush=True)
+            except Exception as e:
+                print("[INIT SL ERROR]", e, flush=True)
 
         return True
 
@@ -298,15 +292,13 @@ def send_order(units, inst, tp=None, sl=None):
 def webhook():
     data = request.get_json(force=True, silent=True) or {}
 
-    print("\n=== NEW SIGNAL ===", data, flush=True)
-
     if not data or data.get("key") != SECRET:
-        print("AUTH FAILED", flush=True)
         return "unauthorized", 403
 
     action = data["action"].lower()
     size = float(data["size"])
     inst = data["ticker"].upper()
+    sl = float(data.get("sl")) if data.get("sl") is not None else None
 
     cur = get_position(inst)
     if cur is None:
@@ -326,18 +318,14 @@ def webhook():
         if unrealized < 0 and dd >= ADD_THRESHOLD:
             delta = size if action == "buy" else -size
         else:
-            print("SKIP SAME DIRECTION", flush=True)
             return "skip"
     else:
         return "skip"
 
-    print(f"[PLAN] delta={delta}", flush=True)
-
     if abs(delta) < MIN_UNITS:
-        print("SKIP MIN UNITS", flush=True)
         return "skip"
 
-    if not send_order(delta, inst):
+    if not send_order(delta, inst, sl):
         return "fail"
 
     return "ok"
