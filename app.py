@@ -1,78 +1,99 @@
-# HYBRID_v1.1 + SL_ENGINE_v1.0 | SINGLE DYNAMIC SL ONLY
+# =====================================================================
+# HYBRID_v1.1 + SL_ENGINE_v1.0 | SINGLE DYNAMIC SL ONLY (PRODUCTION)
+# =====================================================================
 
-# =========================================================
-# NOTES — READ BEFORE TOUCHING ANYTHING
-# =========================================================
+# ========================= CORE MODEL ===============================
+# TRADE TYPES:
+# - NEW  → open fresh position
+# - ADD  → add ONLY when losing AND DD >= threshold
+# - FLIP → full reversal using TARGET MODE (delta = desired - current)
 #
-# CORE MODEL:
-# - FLIP = TARGET MODE
-#     → delta = desired_position - current_position
+# TARGET MODE (CRITICAL):
+# - delta = desired_position - current_position
+# - ensures full reversal in ONE order
+# - relies on: positionFill = REDUCE_FIRST
 #
-# - ADD = INCREMENTAL (ONLY if losing AND DD >= threshold)
+# POSITION RULES:
+# - NO hedging
+# - ONE net position per instrument
+# - ALWAYS operate via delta
+
+# ========================= EXECUTION RULES ==========================
+# ORDER FLOW:
+# - send MARKET order
+# - wait for fill
+# - ONLY attach SL AFTER tradeOpened exists
+# - tradeOpened == None → reduce only → DO NOT attach SL/TP
 #
-# - NEW = INCREMENTAL (when no position)
+# OANDA BEHAVIOR:
+# - REDUCE_FIRST:
+#     → closes opposite trades first
+#     → then opens remainder
+
+# ========================= SL ENGINE ================================
+# SINGLE STOP LOSS SYSTEM
 #
-# ---------------------------------------------------------
-# CRITICAL EXECUTION RULES:
+# - ONE SL per trade
+# - SL ONLY MOVES FORWARD (never backward)
+# - NO TP required (SL captures profit)
 #
-# - positionFill = REDUCE_FIRST
-#     → closes opposite trades before opening new ones
+# LADDER:
+#   ENTRY → BE → LOCK1 → LOCK2
 #
-# - tradeOpened == None
-#     → means NO new trade was created (reduce-only)
-#     → DO NOT attach SL / DO NOT register SL engine
-#
-# - ALWAYS trust OANDA response, not assumptions
-#
-# ---------------------------------------------------------
-# SL ENGINE DESIGN:
-#
-# - ONE dynamic SL only (NO multiple SLs)
-#
-# - Ladder structure:
-#
-#     ENTRY
-#       ↓
-#     BE (Break Even)
-#       ↓
-#     LOCK1 (secure partial profit)
-#       ↓
-#     LOCK2 (secure deeper profit)
-#
-# - SL ONLY MOVES FORWARD (never backwards)
-#
-# ---------------------------------------------------------
-# LADDER LEVELS (percentage-based):
-#
-# BE_LEVEL:
-#   → when price moves enough → SL = entry (risk-free)
+# BE:
+#   SL = entry (risk free)
 #
 # LOCK1:
-#   → further move → lock small profit
+#   lock small profit
 #
 # LOCK2:
-#   → strong move → lock larger profit
+#   lock larger profit
 #
-# ---------------------------------------------------------
-# IMPORTANT BEHAVIOR:
+# IMPORTANT:
+# - later stages overwrite earlier
+# - enforced in update_sl()
+
+# ========================= LEVEL CONFIG =============================
+# Percentage move relative to entry
 #
-# - Ladder overwrites itself:
-#     LOCK2 overrides LOCK1
-#     LOCK1 overrides BE
+# BE_LEVEL:
+#   early protection (~$7–10)
 #
-# - No TP required for system to function
-#   (SL acts as profit capture)
+# LOCK1:
+#   ~first meaningful lock (~$15–20)
 #
-# ---------------------------------------------------------
-# VERIFY AFTER ANY CHANGE:
+# LOCK2:
+#   ~second lock (~$30–35)
 #
-# ✔ flip logic works
-# ✔ add DD gating works
-# ✔ trades register correctly
-# ✔ SL updates forward only
-# ✔ logs visible in Render
+# Tune per volatility
+
+# ========================= CRITICAL FIX =============================
+# MUST use executable price:
 #
-# =========================================================
+# BUY  → use BID
+# SELL → use ASK
+#
+# NOT MID
+#
+# Reason:
+# - exit happens at bid/ask, not mid
+# - using mid delays SL triggers
+
+# ========================= RISK NOTES ===============================
+# - No initial SL until BE triggers → exposure exists
+# - SL engine updates every 1s
+# - price spikes between loops possible
+# - consider adding initial SL if needed
+
+# ========================= VERIFY ===============================
+# After deploy:
+# ✔ flip works
+# ✔ add gating works
+# ✔ SL moves forward only
+# ✔ BE triggers correctly
+# ✔ logs visible
+
+# =====================================================================
 
 from flask import Flask, request
 import requests, os, threading, time
@@ -91,7 +112,6 @@ MIN_UNITS = 1
 
 SL_ENABLED = True
 
-# tuned for faster scalping behavior
 BE_LEVEL    = 0.0015
 LOCK1_TRIG  = 0.0035
 LOCK1_LOCK  = 0.0022
@@ -151,11 +171,10 @@ def register_trade(trade_id, units, price, inst):
     SL_INSTRUMENTS.add(inst)
 
 def update_sl(trade_id, trade, new_sl):
-
     current_sl = trade["sl"]
     side = trade["side"]
 
-    # prevent backward movement
+    # forward-only enforcement
     if current_sl is not None:
         if side == 1 and new_sl <= current_sl:
             return
@@ -171,30 +190,23 @@ def update_sl(trade_id, trade, new_sl):
         )
         trade["sl"] = new_sl
         print("[SL UPDATE] →", new_sl, flush=True)
-
     except Exception as e:
         print("[SL ERROR]", e, flush=True)
 
 def process_trade(trade_id, trade, price):
-
     entry = trade["entry"]
     side = trade["side"]
 
     move = (price - entry) / entry * side
 
-    print(f"[SL CHECK] move={move:.5f}", flush=True)
-
     new_sl = None
 
-    # BE
     if move >= BE_LEVEL:
         new_sl = entry
 
-    # LOCK1
     if move >= LOCK1_TRIG:
         new_sl = entry * (1 + LOCK1_LOCK * side)
 
-    # LOCK2
     if move >= LOCK2_TRIG:
         new_sl = entry * (1 + LOCK2_LOCK * side)
 
@@ -220,11 +232,12 @@ def sl_loop():
                     inst = p["instrument"]
                     bid = float(p["bids"][0]["price"])
                     ask = float(p["asks"][0]["price"])
-                    mid = (bid + ask) / 2
 
                     for tid, trade in list(sl_trades.items()):
                         if trade["inst"] == inst:
-                            process_trade(tid, trade, mid)
+                            # CRITICAL FIX: use executable price
+                            price = bid if trade["side"] == 1 else ask
+                            process_trade(tid, trade, price)
 
         except Exception as e:
             print("[SL LOOP ERROR]", e, flush=True)
@@ -234,7 +247,6 @@ def sl_loop():
 # ===== ORDER =====
 
 def send_order(units, inst, tp=None, sl=None):
-
     print("SENDING:", units, inst, flush=True)
 
     try:
