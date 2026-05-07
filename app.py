@@ -34,45 +34,13 @@
 # TWO LAYERS:
 #
 # 1. INITIAL SL (HARD FLOOR)
-#    - applied immediately after trade opens
-#    - protects against instant adverse move
-#
 # 2. DYNAMIC SL ENGINE (% BASED)
-#    - BE → LOCK1 → LOCK2 → LOCK3
-#    - based on PRICE MOVEMENT (%)
-#    - NOT P/L
 
 # ========================= LADDER =============================
-# BE:
-#   move >= 0.0007 → SL ≈ entry (with buffer)
-#
-# LOCK1:
-#   move >= 0.0021 → lock profit
-#
-# LOCK2:
-#   move >= 0.0050 → more lock
-#
-# LOCK3:
-#   move >= 0.0078 → max lock
-
-# ========================= PRICING ==============================
-# BUY  → use BID
-# SELL → use ASK
-#
-# NOT MID
-# ensures realistic execution behavior
-
-# ========================= CRITICAL FIX =========================
-# - CLOSED TRADES ARE REMOVED
-# - prevents SL corruption
-
-# ========================= VERIFY ======================
-# ✔ initial SL appears immediately
-# ✔ BE triggers early
-# ✔ SL only moves forward
-# ✔ no ghost trades
-# =====================================================================
-
+# BE:     0.0007
+# LOCK1:  0.0021
+# LOCK2:  0.0050
+# LOCK3:  0.0078
 
 from flask import Flask, request
 import requests, os, threading, time
@@ -87,19 +55,14 @@ BASE_URL = "https://api-fxtrade.oanda.com/v3"
 ADD_THRESHOLD = 0.03
 MIN_UNITS = 1
 
-# ===== SL ENGINE CONFIG =====
-
 SL_ENABLED = True
 
 BE_LEVEL   = 0.0007
 BE_BUFFER  = 0.0005
-
 LOCK1_TRIG = 0.0021
 LOCK1_LOCK = 0.0014
-
 LOCK2_TRIG = 0.0050
 LOCK2_LOCK = 0.0035
-
 LOCK3_TRIG = 0.0078
 LOCK3_LOCK = 0.0055
 
@@ -240,4 +203,110 @@ def sl_loop():
 
         time.sleep(1)
 
-# ===== ORDER / WEBHOOK / RUN (UNCHANGED) =====
+# ===== ORDER =====
+
+def send_order(units, inst, sl=None):
+    print("SENDING:", units, inst, flush=True)
+
+    try:
+        r = requests.post(
+            f"{BASE_URL}/accounts/{ACCOUNT}/orders",
+            headers=headers(),
+            json={
+                "order": {
+                    "instrument": inst,
+                    "units": str(int(units)),
+                    "type": "MARKET",
+                    "timeInForce": "FOK",
+                    "positionFill": "REDUCE_FIRST"
+                }
+            },
+            timeout=5
+        )
+
+        print("OANDA:", r.status_code, r.text, flush=True)
+
+        if r.status_code != 201:
+            return False
+
+        fill = r.json().get("orderFillTransaction")
+        if not fill:
+            return False
+
+        trade_opened = fill.get("tradeOpened")
+        if not trade_opened:
+            return True
+
+        trade_id = trade_opened["tradeID"]
+        price = float(fill["price"])
+
+        register_trade(trade_id, units, price, inst)
+
+        if sl is not None:
+            sl_price = price - sl if units > 0 else price + sl
+
+            requests.put(
+                f"{BASE_URL}/accounts/{ACCOUNT}/trades/{trade_id}/orders",
+                headers=headers(),
+                json={"stopLoss": {"price": str(round(sl_price, 3))}},
+                timeout=5
+            )
+            print("[INIT SL] →", sl_price, flush=True)
+
+        return True
+
+    except Exception as e:
+        print("ORDER ERROR:", e, flush=True)
+        return False
+
+# ===== WEBHOOK =====
+
+@app.route("/", methods=["POST"])
+def webhook():
+    data = request.get_json(force=True, silent=True) or {}
+
+    if not data or data.get("key") != SECRET:
+        return "unauthorized", 403
+
+    action = data["action"].lower()
+    size = float(data["size"])
+    inst = data["ticker"].upper()
+    sl = float(data.get("sl")) if data.get("sl") else None
+
+    cur = get_position(inst)
+    if cur is None:
+        return "fail"
+
+    same = (action == "buy" and cur > 0) or (action == "sell" and cur < 0)
+    flip = (action == "buy" and cur < 0) or (action == "sell" and cur > 0)
+
+    unrealized, dd = get_instrument_dd(inst)
+
+    if cur == 0:
+        delta = size if action == "buy" else -size
+    elif flip:
+        desired = abs(size) if action == "buy" else -abs(size)
+        delta = desired - cur
+    elif same:
+        if unrealized < 0 and dd >= ADD_THRESHOLD:
+            delta = size if action == "buy" else -size
+        else:
+            return "skip"
+    else:
+        return "skip"
+
+    if abs(delta) < MIN_UNITS:
+        return "skip"
+
+    if not send_order(delta, inst, sl):
+        return "fail"
+
+    return "ok"
+
+# ===== RUN =====
+
+if SL_ENABLED:
+    threading.Thread(target=sl_loop, daemon=True).start()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
