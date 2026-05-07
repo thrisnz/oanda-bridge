@@ -1,5 +1,5 @@
 # =====================================================================
-# HYBRID_v1.4 + SL_ENGINE_v1.3 | TRUE P/L LADDER (FINAL)
+# HYBRID_v1.5 + SL_ENGINE_v1.4 | % LADDER (FINAL STABLE)
 # =====================================================================
 
 # ========================= CORE MODEL ===============================
@@ -37,51 +37,40 @@
 #    - applied immediately after trade opens
 #    - protects against instant adverse move
 #
-# 2. DYNAMIC SL ENGINE (TRUE P/L BASED)
+# 2. DYNAMIC SL ENGINE (% BASED)
 #    - BE → LOCK1 → LOCK2 → LOCK3
-#    - TRIGGERED by REAL unrealized P/L (NOT %)
-#    - SL placement remains PRICE-BASED (broker requirement)
+#    - based on PRICE MOVEMENT (%)
+#    - NOT P/L
 #
-# ========================= LADDER LOGIC =============================
+# ========================= LADDER =============================
 # BE:
-#   unrealizedPL >= $10 → SL = entry ± buffer (~-$3)
+#   move >= 0.0016 → SL ≈ entry (with buffer)
 #
 # LOCK1:
-#   unrealizedPL >= $30 → SL locks ~$20 profit
+#   move >= 0.0065 → lock profit
 #
 # LOCK2:
-#   unrealizedPL >= $70 → SL locks ~$50 profit
+#   move >= 0.0150 → more lock
 #
 # LOCK3:
-#   unrealizedPL >= $110 → SL locks ~$80 profit
+#   move >= 0.0235 → max lock
 #
-# NOTE:
-# - SL ONLY MOVES FORWARD (never backward)
-# - later stages overwrite earlier ones automatically
-
 # ========================= PRICING ==============================
 # BUY  → use BID
 # SELL → use ASK
 #
 # NOT MID
-# because execution happens on bid/ask, not midpoint
+# ensures realistic execution behavior
 
-# ========================= KEY INSIGHT ==============================
-# - OLD SYSTEM: trigger = % move (caused mismatch vs P/L)
-# - NEW SYSTEM: trigger = REAL P/L → matches what you see on screen
-# - eliminates: “$20 profit but no SL shift” issue
-#
-# ========================= PERFORMANCE ==============================
-# - 1x pricing call per loop
-# - 1x openTrades call per loop (for P/L)
-# - loop interval: 1 second
-#
-# ========================= VERIFY AFTER DEPLOY ======================
+# ========================= CRITICAL FIX =========================
+# - CLOSED TRADES ARE REMOVED
+# - prevents SL corruption (e.g. 2039 bug)
+
+# ========================= VERIFY ======================
 # ✔ initial SL appears immediately
-# ✔ BE triggers around +$10
-# ✔ locks trigger at correct P/L levels
+# ✔ BE triggers early (0.0016)
 # ✔ SL only moves forward
-# ✔ no missing protection
+# ✔ no ghost trades
 # =====================================================================
 
 
@@ -102,6 +91,18 @@ MIN_UNITS = 1
 
 SL_ENABLED = True
 
+BE_LEVEL   = 0.0016
+BE_BUFFER  = 0.0007
+
+LOCK1_TRIG = 0.0065
+LOCK1_LOCK = 0.0043
+
+LOCK2_TRIG = 0.0150
+LOCK2_LOCK = 0.0105
+
+LOCK3_TRIG = 0.0235
+LOCK3_LOCK = 0.0180
+
 sl_trades = {}
 SL_INSTRUMENTS = set()
 
@@ -119,8 +120,7 @@ def get_position(inst):
             if p["instrument"] == inst:
                 return float(p["long"]["units"]) + float(p["short"]["units"])
         return 0.0
-    except Exception as e:
-        print("POSITION ERROR:", e, flush=True)
+    except:
         return None
 
 def get_instrument_dd(inst):
@@ -155,7 +155,7 @@ def update_sl(trade_id, trade, new_sl):
     current_sl = trade["sl"]
     side = trade["side"]
 
-    # ===== FORWARD-ONLY PROTECTION =====
+    # forward-only protection
     if current_sl is not None:
         if side == 1 and new_sl <= current_sl:
             return
@@ -174,29 +174,25 @@ def update_sl(trade_id, trade, new_sl):
     except Exception as e:
         print("[SL ERROR]", e, flush=True)
 
-def process_trade(trade_id, trade, price, pl):
+def process_trade(trade_id, trade, price):
     entry = trade["entry"]
     side = trade["side"]
 
+    move = (price - entry) / entry * side
+
     new_sl = None
 
-    # ===== TRUE P/L LADDER =====
+    if move >= BE_LEVEL:
+        new_sl = entry * (1 - BE_BUFFER * side)
 
-    # BE (with buffer ~ -$3)
-    if pl >= 10:
-        new_sl = entry * (1 - (3 / entry) * side)
+    if move >= LOCK1_TRIG:
+        new_sl = entry * (1 + LOCK1_LOCK * side)
 
-    # LOCK1 (~$30 → lock ~$20)
-    if pl >= 30:
-        new_sl = entry * (1 + (20 / entry) * side)
+    if move >= LOCK2_TRIG:
+        new_sl = entry * (1 + LOCK2_LOCK * side)
 
-    # LOCK2 (~$70 → lock ~$50)
-    if pl >= 70:
-        new_sl = entry * (1 + (50 / entry) * side)
-
-    # LOCK3 (~$110 → lock ~$80)
-    if pl >= 110:
-        new_sl = entry * (1 + (80 / entry) * side)
+    if move >= LOCK3_TRIG:
+        new_sl = entry * (1 + LOCK3_LOCK * side)
 
     if new_sl is not None:
         update_sl(trade_id, trade, new_sl)
@@ -208,20 +204,22 @@ def sl_loop():
                 time.sleep(1)
                 continue
 
-            # ===== GET LIVE TRADES (P/L + CLEANUP) =====
-            trades_map = {}
-
+            # ===== CLEAN CLOSED TRADES =====
             r_trades = requests.get(
                 f"{BASE_URL}/accounts/{ACCOUNT}/openTrades",
                 headers=headers(),
                 timeout=5
             )
 
+            open_ids = set()
             if r_trades.status_code == 200:
-                for t in r_trades.json()["trades"]:
-                    trades_map[t["id"]] = float(t["unrealizedPL"])
+                open_ids = set(t["id"] for t in r_trades.json().get("trades", []))
 
-            # ===== GET PRICES =====
+            for tid in list(sl_trades.keys()):
+                if tid not in open_ids:
+                    sl_trades.pop(tid, None)
+
+            # ===== PRICING =====
             r = requests.get(
                 f"{BASE_URL}/accounts/{ACCOUNT}/pricing",
                 headers=headers(),
@@ -236,17 +234,9 @@ def sl_loop():
                     ask = float(p["asks"][0]["price"])
 
                     for tid, trade in list(sl_trades.items()):
-
-                        # REMOVE CLOSED TRADES
-                        if tid not in trades_map:
-                            sl_trades.pop(tid, None)
-                            continue
-
                         if trade["inst"] == inst:
                             price = bid if trade["side"] == 1 else ask
-                            pl = trades_map.get(tid, 0)
-
-                            process_trade(tid, trade, price, pl)
+                            process_trade(tid, trade, price)
 
         except Exception as e:
             print("[SL LOOP ERROR]", e, flush=True)
@@ -292,12 +282,8 @@ def send_order(units, inst, sl=None):
 
         register_trade(trade_id, units, price, inst)
 
-        # ===== INITIAL SL =====
         if sl is not None:
-            if units > 0:
-                sl_price = price - sl
-            else:
-                sl_price = price + sl
+            sl_price = price - sl if units > 0 else price + sl
 
             try:
                 requests.put(
