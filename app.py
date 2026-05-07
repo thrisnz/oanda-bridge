@@ -1,5 +1,5 @@
 # =====================================================================
-# HYBRID_v1.5 + SL_ENGINE_v1.4 | % LADDER (FINAL STABLE)
+# HYBRID_v1.6 + SL_ENGINE_v1.5 | % LADDER (P/L CALIBRATED)
 # =====================================================================
 
 # ========================= CORE MODEL ===============================
@@ -37,10 +37,11 @@
 # 2. DYNAMIC SL ENGINE (% BASED)
 
 # ========================= LADDER =============================
-# BE:     0.0007
-# LOCK1:  0.0021
-# LOCK2:  0.0050
-# LOCK3:  0.0078
+# calibrated to behave like:
+# $10  → BE (~ -$5 buffer)
+# $30  → lock $20
+# $70  → lock $50
+# $110 → lock $90
 
 from flask import Flask, request
 import requests, os, threading, time
@@ -57,14 +58,15 @@ MIN_UNITS = 1
 
 SL_ENABLED = True
 
-BE_LEVEL   = 0.0007
-BE_BUFFER  = 0.0005
-LOCK1_TRIG = 0.0021
-LOCK1_LOCK = 0.0014
-LOCK2_TRIG = 0.0050
-LOCK2_LOCK = 0.0035
-LOCK3_TRIG = 0.0078
-LOCK3_LOCK = 0.0055
+# ===== FIXED LADDER =====
+BE_LEVEL   = 0.0022
+BE_BUFFER  = 0.0011
+LOCK1_TRIG = 0.0065
+LOCK1_LOCK = 0.0043
+LOCK2_TRIG = 0.0150
+LOCK2_LOCK = 0.0105
+LOCK3_TRIG = 0.0235
+LOCK3_LOCK = 0.0190
 
 sl_trades = {}
 SL_INSTRUMENTS = set()
@@ -271,7 +273,7 @@ def webhook():
     action = data["action"].lower()
     size = float(data["size"])
     inst = data["ticker"].upper()
-    sl = float(data.get("sl")) if data.get("sl") else None
+    sl = float(data["sl"]) if "sl" in data else None
 
     cur = get_position(inst)
     if cur is None:
