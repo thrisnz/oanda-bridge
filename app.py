@@ -60,13 +60,9 @@ SL_ENABLED = True
 
 # ===== FIXED LADDER =====
 BE_LEVEL   = 0.0021
-BE_BUFFER  = 0.0005
+BE_BUFFER  = 0.0000
 LOCK1_TRIG = 0.0036
-LOCK1_LOCK = 0.0022
-LOCK2_TRIG = 0.0149
-LOCK2_LOCK = 0.0105
-LOCK3_TRIG = 0.0234
-LOCK3_LOCK = 0.0190
+LOCK1_LOCK = 0.0023
 
 sl_trades = {}
 SL_INSTRUMENTS = set()
@@ -151,12 +147,6 @@ def process_trade(trade_id, trade, price):
 
     if move >= LOCK1_TRIG:
         new_sl = entry * (1 + LOCK1_LOCK * side)
-
-    if move >= LOCK2_TRIG:
-        new_sl = entry * (1 + LOCK2_LOCK * side)
-
-    if move >= LOCK3_TRIG:
-        new_sl = entry * (1 + LOCK3_LOCK * side)
 
     if new_sl is not None:
         update_sl(trade_id, trade, new_sl)
