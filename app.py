@@ -47,7 +47,7 @@ SECRET  = os.environ.get("SECRET")
 
 BASE_URL = "https://api-fxtrade.oanda.com/v3"
 
-ADD_THRESHOLD = 0.01
+ADD_THRESHOLD = 0.015
 MIN_UNITS = 1
 
 SL_ENABLED = True
@@ -57,7 +57,7 @@ BE_LEVEL   = 0.00125
 BE_BUFFER  = 0.0003   # 🔥 important: avoids instant stopout at BE
 LOCK1_TRIG = 0.0032
 LOCK1_LOCK = 0.0020
-LOCK2_TRIG = 0.0052
+LOCK2_TRIG = 0.0048
 LOCK2_LOCK = 0.0033
 
 # ===== STATE =====
