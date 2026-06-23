@@ -159,7 +159,7 @@ def process_trade(trade_id, trade, price):
 
     # ===== BREAK EVEN =====
     if move >= BE_LEVEL:
-        new_sl = entry * (1 + BE_BUFFER * side)
+        new_sl = entry * (1 - BE_BUFFER * side)
 
     # ===== LOCK 1 =====
     if move >= LOCK1_TRIG:
