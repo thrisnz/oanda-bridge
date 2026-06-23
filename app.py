@@ -54,7 +54,7 @@ SL_ENABLED = True
 
 # ===== LADDER (PERCENT BASED) =====
 BE_LEVEL   = 0.00125
-BE_BUFFER  = 0.0005   # 🔥 important: avoids instant stopout at BE
+BE_BUFFER  = 0.0003   # 🔥 important: avoids instant stopout at BE
 LOCK1_TRIG = 0.0033
 LOCK1_LOCK = 0.0018
 LOCK2_TRIG = 0.0048
@@ -159,7 +159,7 @@ def process_trade(trade_id, trade, price):
 
     # ===== BREAK EVEN =====
     if move >= BE_LEVEL:
-        new_sl = entry * (1 - BE_BUFFER * side)
+        new_sl = entry * (1 + BE_BUFFER * side)
 
     # ===== LOCK 1 =====
     if move >= LOCK1_TRIG:
