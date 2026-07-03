@@ -55,8 +55,8 @@ SL_ENABLED = True
 # ===== LADDER (PERCENT BASED) =====
 BE_LEVEL   = 0.00125
 BE_BUFFER  = 0.001   # 🔥 important: avoids instant stopout at BE
-LOCK1_TRIG = 0.0037
-LOCK1_LOCK = 0.0014
+LOCK1_TRIG = 0.0038
+LOCK1_LOCK = 0.0013
 LOCK2_TRIG = 0.0045
 LOCK2_LOCK = 0.0033
 
