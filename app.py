@@ -50,14 +50,14 @@ BASE_URL = "https://api-fxtrade.oanda.com/v3"
 ADD_THRESHOLD = 0.035
 MIN_UNITS = 1
 
-SL_ENABLED = False
+SL_ENABLED = True
 
 # ===== LADDER (PERCENT BASED) =====
 BE_LEVEL   = 0.00125
 BE_BUFFER  = 0.001   # 🔥 important: avoids instant stopout at BE
-LOCK1_TRIG = 0.0040
+LOCK1_TRIG = 0.0043
 LOCK1_LOCK = 0.0010
-LOCK2_TRIG = 0.0055
+LOCK2_TRIG = 0.0060
 LOCK2_LOCK = 0.0033
 
 # ===== STATE =====
