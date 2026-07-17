@@ -47,10 +47,10 @@ SECRET  = os.environ.get("SECRET")
 
 BASE_URL = "https://api-fxtrade.oanda.com/v3"
 
-ADD_THRESHOLD = 0.025
+ADD_THRESHOLD = 0.035
 MIN_UNITS = 1
 
-SL_ENABLED = True
+SL_ENABLED = False
 
 # ===== LADDER (PERCENT BASED) =====
 BE_LEVEL   = 0.00125
